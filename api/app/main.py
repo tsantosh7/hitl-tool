@@ -8,9 +8,11 @@ import urllib.parse
 from datetime import datetime, date
 from typing import Any, Dict, List, Optional, Iterable, Tuple
 from uuid import uuid4
+import urllib.parse
+
 
 from pydantic import BaseModel, Field
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, HttpUrl
 from sqlalchemy import select
@@ -24,7 +26,6 @@ import uuid
 from sqlalchemy import func
 
 
-from uuid import UUID
 import csv
 import io
 from fastapi.responses import StreamingResponse
@@ -42,11 +43,22 @@ from .init_db import init
 from .models import (
     Team, Project, Document, ProjectDocument,
     HypothesisGroup, HypothesisAnnotation,
-    Code, CodeAlias,
+    Code, CodeAlias, ProjectDocumentReview
 )
 
 
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List, Dict, Any
+
+from pydantic import BaseModel, Field
+from uuid import UUID
+import random
+
+from fastapi import Query
+
+import logging
+logger = logging.getLogger(__name__)
+
+
 
 SOLR_BASE_URL = os.getenv("SOLR_BASE_URL", "").strip()
 HYPOTHESIS_API_TOKEN = os.getenv("HYPOTHESIS_API_TOKEN", "").strip()
@@ -56,8 +68,11 @@ HYPOTHESIS_API_BASE = "https://api.hypothes.is/api"
 
 # Global-core model: projects point to one shared Solr core
 SOLR_GLOBAL_CORE = os.getenv("SOLR_GLOBAL_CORE", "hitl_test").strip() or "hitl_test"
+# _SOLR_FQ_NEEDS_QUOTES = re.compile(r"""[ :\[\]\(\)\{\}"'\\]""")  # includes colon + common specials
+_SOLR_NEEDS_QUOTES = re.compile(r"""[\s:\[\]\(\)\{\}"'\\]""")  # whitespace, colon, etc.
 
 # ------------------------------------------------------------------------------
+
 # Hypothesis public group safety (NEVER sync __world__ unless explicitly requested)
 # ------------------------------------------------------------------------------
 HYPOTHESIS_PUBLIC_GROUP_ID = "__world__"
@@ -689,6 +704,132 @@ def normalize_fq_list(fq):
     return [x for x in fq if x]
 
 
+
+# def normalize_fq(fq: str) -> str:
+#     """
+#     Convert fq strings like:
+#       review_status_by_project_ss:5749...:done
+#     into:
+#       review_status_by_project_ss:"5749...:done"
+#     so Solr doesn't choke on ':' inside the value.
+#     """
+#     fq = (fq or "").strip()
+#     if not fq or ":" not in fq:
+#         return fq
+#
+#     # don't touch already-quoted fq or local params
+#     if '"' in fq or fq.lstrip().startswith("{!"):
+#         return fq
+#
+#     field, value = fq.split(":", 1)
+#     field = field.strip()
+#     value = value.strip()
+#
+#     if not field or not value:
+#         return fq
+#
+#     if _SOLR_NEEDS_QUOTES.search(value):
+#         value = value.replace("\\", "\\\\").replace('"', '\\"')
+#         return f'{field}:"{value}"'
+#
+#     return fq
+
+def normalize_fq(fq: str) -> str:
+    """
+    Normalize fq strings so Solr doesn't 400 when values contain special chars.
+    Key fix: if fq is `field:value` and `value` contains ":" (like UUID:done),
+    wrap the value in quotes.
+
+    Examples:
+      review_status_by_project_ss:UUID:done  -> review_status_by_project_ss:"UUID:done"
+      project_ids_ss:UUID                   -> unchanged
+      {!tag=x}field:value                   -> unchanged
+    """
+    if not fq:
+        return fq
+
+    fq = fq.strip()
+
+    # leave localparams alone
+    if fq.startswith("{!"):
+        return fq
+
+    # if already quoted somewhere, don't second-guess
+    # (still fine if user passes correct escaping)
+    if '"' in fq:
+        return fq
+
+    # Only handle simple field:value forms
+    if ":" not in fq:
+        return fq
+
+    field, value = fq.split(":", 1)
+    field = field.strip()
+    value = value.strip()
+
+    if not field or not value:
+        return fq
+
+    # If the value contains characters that commonly break Solr parsing, quote it.
+    # Colon is the big one for your case (UUID:done).
+    needs_quotes = (":" in value) or (" " in value) or ("(" in value) or (")" in value)
+
+    if needs_quotes:
+        value_escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+        return f'{field}:"{value_escaped}"'
+
+    return fq
+
+def solr_update_review_status(core: str, updates: list[dict]) -> int:
+    """
+    updates: [{"document_id_s": "...", "project_id": "...", "status": "done"}, ...]
+    Writes/overwrites one project_id:status entry inside review_status_by_project_ss.
+
+    Implementation approach:
+      - query existing review_status_by_project_ss for doc
+      - replace matching project_id:* entry
+      - atomic set the full list
+    """
+    if not updates:
+        return 0
+
+    # fetch current values for docs in one query
+    doc_ids = [u["document_id_s"] for u in updates]
+    q = "document_id_s:(" + " ".join(solr_escape_term(x) for x in doc_ids) + ")"
+
+    current = solr_select(core, {
+        "q": q,
+        "rows": len(doc_ids),
+        "fl": "document_id_s,review_status_by_project_ss",
+        "wt": "json",
+    })
+    cur_docs = {d["document_id_s"]: d.get("review_status_by_project_ss", []) for d in current.get("response", {}).get("docs", [])}
+
+    atomic_docs = []
+    for u in updates:
+        did = u["document_id_s"]
+        pid = str(u["project_id"])
+        st = u["status"]
+
+        existing = cur_docs.get(did) or []
+        if isinstance(existing, str):
+            existing = [existing]
+
+        # remove old entry for this project
+        new_list = [x for x in existing if not str(x).startswith(pid + ":")]
+        new_list.append(f"{pid}:{st}")
+
+        atomic_docs.append({
+            "document_id_s": did,
+            "review_status_by_project_ss": {"set": sorted(set(new_list))}
+        })
+
+    # chunk updates
+    updated = 0
+    for batch in chunked(atomic_docs, 200):
+        solr_atomic_update(core, batch, commit_within_ms=5000)
+        updated += len(batch)
+    return updated
 
 # ------------------------------------------------------------------------------
 # Corpus ingestion Solr doc builder (patched)
@@ -1760,6 +1901,37 @@ def recompute_solr_projects(core: str = "hitl_test", project_id: Optional[UUID] 
         db.close()
 
 
+@app.post("/solr/recompute_project_membership")
+def solr_recompute_project_membership(
+    project_id: UUID,
+    core: str = "hitl_test",
+):
+    """
+    Push project_documents membership into Solr.project_ids_ss for all docs in the project.
+    Useful after SQL bootstraps or rebuilds.
+    """
+    db = SessionLocal()
+    try:
+        doc_ids = db.execute(
+            select(ProjectDocument.document_id)
+            .where(ProjectDocument.project_id == project_id)
+        ).scalars().all()
+
+        if not doc_ids:
+            return {"ok": True, "project_id": str(project_id), "docs_in_project": 0, "solr_updated": 0}
+
+        atomic_docs = [{"document_id_s": did, "project_ids_ss": {"add": str(project_id)}} for did in doc_ids]
+
+        updated = 0
+        for batch in chunked(atomic_docs, 500):
+            solr_atomic_update(core, batch, commit_within_ms=5000)
+            updated += len(batch)
+
+        return {"ok": True, "core": core, "project_id": str(project_id), "docs_in_project": len(doc_ids), "solr_updated": updated}
+    finally:
+        db.close()
+
+
 ##Add the minimal code-registry API (optional but recommended)
 
 # If you want users/admins to actually “Add Codes” without touching DB manually.
@@ -2343,103 +2515,132 @@ def list_project_documents(project_id: UUID, limit: int = 50, offset: int = 0):
     finally:
         db.close()
 
-
-
-
-############# SEARCH and SAMPLE ###########
-# GET /search endpoint (facets + filtering + project scope)
-# What it supports
-#
-# q free-text (default *:*)
-#
-# fq repeatable filters
-#
-# project_id → auto adds fq=project_ids_ss:<uuid>
-#
-# facets on:
-# doc_type_s, source_s, judges_ss, has_human_b, codes_all_ss, appeal_outcome_s
-#
-# pagination: start, rows
-#
-# returns: docs + facets + numFound
+#################################################################
+# SEARCH and SAMOKE
+#################################################################
 
 @app.get("/search")
 def search(
-    core: str = "hitl_test",
     q: str = "*:*",
-    fq: Optional[list[str]] = None,      # repeat ?fq=...&fq=...
-    project_id: Optional[UUID] = None,
+    core: str = "hitl_test",
     rows: int = 20,
     start: int = 0,
-    facet: bool = True,
+    fq: Optional[List[str]] = Query(None),
+    project_id: Optional[str] = None,
+    include_hypothesis_links: bool = False,
+    group_id: Optional[str] = None,
 ):
-    fq_list = normalize_fq_list(fq)
+    """
+    Solr-backed search endpoint.
+    fq is passed through but normalized so values containing ':' are safe
+    (e.g. review_status_by_project_ss:<project_id>:done).
+    """
 
-    if project_id:
-        fq_list.append(f"project_ids_ss:{solr_escape_term(str(project_id))}")
-
-    facet_fields = [
-        "doc_type_s",
-        "source_s",
-        "judges_ss",
-        "has_human_b",
-        "codes_all_ss",
-        "appeal_outcome_s",
-    ]
-
-    params = {
-        "q": q or "*:*",
+    params: Dict[str, Any] = {
+        "q": q,
         "rows": rows,
         "start": start,
         "wt": "json",
-        "fl": ",".join([
-            "document_id_s",
-            "canonical_url_s",
-            "title_txt",
-            "excerpt_txt",
-            "published_dt",
+        "fl": ",".join(
+            [
+                "document_id_s",
+                "canonical_url_s",
+                "title_txt",
+                "excerpt_txt",
+                "published_dt",
+                "doc_type_s",
+                "source_s",
+                "judges_ss",
+                "has_human_b",
+                "has_any_span_b",
+                "codes_v1_ss",
+                "codes_ext_ss",
+                "codes_all_ss",
+                "project_ids_ss",
+            ]
+        ),
+        "facet": "true",
+        "facet.mincount": 1,
+        "facet.limit": 50,
+        "facet.field": [
             "doc_type_s",
             "source_s",
             "judges_ss",
             "has_human_b",
-            "has_any_span_b",
-            "codes_v1_ss",
-            "codes_ext_ss",
             "codes_all_ss",
-            "project_ids_ss",
-        ]),
+            "appeal_outcome_s",
+        ],
     }
+
+    # -----------------------------
+    # Filters (fq + project scope)
+    # -----------------------------
+    fq_list: List[str] = []
+    has_review_filter = False
+
+
+    if fq:
+        for x in fq:
+            if not x:
+                continue
+            if x.startswith("review_status_by_project_ss:"):
+                has_review_filter = True
+            fq_list.append(normalize_fq(x))
+
+    # 🔍 DEBUG GUARDRAIL
+    if project_id and has_review_filter:
+        logger.debug(
+            "Project filter skipped: review_status_by_project_ss already scopes project",
+            extra={"project_id": project_id, "fq": fq_list},
+        )
+
+    # Only add project filter if NOT already implied by review_status
+    if project_id and not has_review_filter:
+        fq_list.append(normalize_fq(f"project_ids_ss:{project_id}"))
 
     if fq_list:
         params["fq"] = fq_list
 
-    if facet:
-        params.update({
-            "facet": "true",
-            "facet.mincount": 1,
-            "facet.limit": 50,
-        })
-        # multiple facet.field supported by repeating param in requests
-        # easiest: add as list
-        params["facet.field"] = facet_fields
-
+    # -----------------------------
+    # Query Solr
+    # -----------------------------
     data = solr_select(core, params)
 
     resp = data.get("response", {}) or {}
-    out = {
+    docs = resp.get("docs", []) or []
+    facets = (data.get("facet_counts", {}) or {}).get("facet_fields", {}) or {}
+
+    # -----------------------------
+    # Normalize docs + add links
+    # -----------------------------
+    out_docs = []
+    for d in docs:
+        doc = dict(d)
+
+        cu = doc.get("canonical_url_s")
+        if isinstance(cu, list):
+            cu = cu[0] if cu else None
+        doc["canonical_url_s"] = cu
+
+        if include_hypothesis_links and cu:
+            gid = group_id or "__world__"
+            doc["hypothesis_incontext"] = build_hypothesis_incontext(cu, gid)
+
+        out_docs.append(doc)
+
+    return {
         "ok": True,
         "core": core,
         "q": q,
         "fq": fq_list,
         "numFound": resp.get("numFound", 0),
-        "start": resp.get("start", 0),
-        "docs": resp.get("docs", []) or [],
+        "start": start,
+        "rows": rows,
+        "docs": out_docs,
+        "facets": facets,
     }
 
-    if facet:
-        out["facets"] = data.get("facet_counts", {}) or {}
 
-    return out
 
 # 3) POST /sample endpoint (random sample via rand_f)
 # Why this is the right approach
@@ -2455,6 +2656,7 @@ def search(
 # This is fast, scalable, and doesn’t require expensive random sort.
 #
 # Payload model
+
 class SampleRequest(BaseModel):
     core: str = "hitl_test"
     q: str = "*:*"
@@ -2462,18 +2664,19 @@ class SampleRequest(BaseModel):
     project_id: Optional[UUID] = None
     n: int = 20
 
-# Endpoint
 @app.post("/sample")
 def sample_docs(payload: SampleRequest):
     core = payload.core
     q = payload.q or "*:*"
     n = max(1, min(int(payload.n), 500))  # cap for safety
 
-    fq_list = list(payload.fq or [])
-    if payload.project_id:
-        fq_list.append(f"project_ids_ss:{solr_escape_term(str(payload.project_id))}")
+    # Normalize all incoming fqs (handles review_status_by_project_ss:<uuid>:done)
+    fq_list = [normalize_fq(x) for x in (payload.fq or []) if x]
 
-    # base fields returned
+    # Project scoping (Solr membership)
+    if payload.project_id:
+        fq_list.append(normalize_fq(f"project_ids_ss:{str(payload.project_id)}"))
+
     fl = ",".join([
         "document_id_s",
         "canonical_url_s",
@@ -2491,6 +2694,8 @@ def sample_docs(payload: SampleRequest):
     ])
 
     r = random.random()
+
+    # Also normalize the rand filters (not strictly necessary, but consistent)
     fq_hi = fq_list + [f"rand_f:[{r} TO 1]"]
     fq_lo = fq_list + [f"rand_f:[0 TO {r})"]
 
@@ -2510,10 +2715,9 @@ def sample_docs(payload: SampleRequest):
 
     docs = fetch(fq_hi, n)
     if len(docs) < n:
-        more = fetch(fq_lo, n - len(docs))
-        docs.extend(more)
+        docs.extend(fetch(fq_lo, n - len(docs)))
 
-    # de-dupe by document_id_s (just in case)
+    # de-dupe by document_id_s
     seen = set()
     uniq = []
     for d in docs:
@@ -2525,6 +2729,12 @@ def sample_docs(payload: SampleRequest):
         if len(uniq) >= n:
             break
 
+    # normalize canonical_url_s to scalar for consistency with /search
+    for d in uniq:
+        cu = d.get("canonical_url_s")
+        if isinstance(cu, list):
+            d["canonical_url_s"] = cu[0] if cu else None
+
     return {
         "ok": True,
         "core": core,
@@ -2535,3 +2745,276 @@ def sample_docs(payload: SampleRequest):
         "rand_seed": r,
         "docs": uniq,
     }
+
+
+###################################
+
+def build_hypothesis_incontext(canonical_url: str, group_id: str) -> str:
+    """
+    Build a Hypothesis in-context link for a document URL and group.
+    """
+    return (
+        "https://hyp.is/go?url="
+        + urllib.parse.quote(canonical_url, safe="")
+        + "&group="
+        + urllib.parse.quote(group_id, safe="")
+    )
+
+
+
+@app.get("/hypothesis/link")
+def hypothesis_link(
+    document_id: str,
+    group_id: Optional[str] = None,
+):
+    """
+    Returns Hypothesis-friendly links for a document.
+
+    - If group_id is provided, the link will open Hypothesis in that group context.
+    - If not provided, it will default to the user's first enabled non-public group (if present),
+      else fall back to public.
+    """
+    db = SessionLocal()
+    try:
+        doc = db.get(Document, document_id)
+        if not doc or not doc.canonical_url:
+            raise HTTPException(404, "document not found or has no canonical_url")
+
+        url = doc.canonical_url
+
+        # pick default group if not provided
+        gid = group_id
+        if not gid:
+            g = db.execute(
+                select(HypothesisGroup)
+                .where(HypothesisGroup.is_enabled == True)
+                .order_by(HypothesisGroup.is_public.asc(), HypothesisGroup.group_id.asc())
+            ).scalars().first()
+            gid = g.group_id if g else "__world__"
+
+        # Hypothesis "via" incontext link format:
+        # https://hyp.is/go?url=<ENCODED_URL>&group=<GROUP_ID>
+        incontext = "https://hyp.is/go?url=" + urllib.parse.quote(url, safe="") + "&group=" + urllib.parse.quote(gid, safe="")
+
+        # Direct "annotate" page in Hypothesis client (optional)
+        # This usually lands you in the sidebar for that URL in that group
+        direct = "https://hypothes.is/?url=" + urllib.parse.quote(url, safe="") + "&group=" + urllib.parse.quote(gid, safe="")
+
+        return {
+            "ok": True,
+            "document_id": document_id,
+            "canonical_url": url,
+            "group_id": gid,
+            "hypothesis_incontext": incontext,
+            "hypothesis_direct": direct,
+        }
+    finally:
+        db.close()
+
+
+@app.get("/hypothesis/groups")
+def list_hypothesis_groups():
+    """
+    List enabled Hypothesis groups for the current user.
+    Robust to minor model-field naming differences.
+    """
+    db = SessionLocal()
+    try:
+        rows = (
+            db.execute(
+                select(HypothesisGroup)
+                .where(HypothesisGroup.is_enabled == True)
+            )
+            .scalars()
+            .all()
+        )
+
+        groups = []
+        for g in rows:
+            # tolerate different column names
+            gid = getattr(g, "group_id", None) or getattr(g, "id", None)
+            name = getattr(g, "name", None) or getattr(g, "group_name", None) or ""
+            is_public = getattr(g, "is_public", None)
+            if is_public is None:
+                is_public = getattr(g, "public", None)
+            if is_public is None:
+                is_public = False
+
+            groups.append(
+                {
+                    "group_id": gid,
+                    "name": name,
+                    "is_public": bool(is_public),
+                    "is_enabled": bool(getattr(g, "is_enabled", True)),
+                }
+            )
+
+        # stable ordering: non-public first, then name, then id
+        groups.sort(key=lambda x: (x["is_public"], x["name"], x["group_id"] or ""))
+
+        return {"ok": True, "groups": groups}
+    finally:
+        db.close()
+
+
+
+class ReviewUpdateRequest(BaseModel):
+    document_ids: List[str]
+    status: str  # unseen|in_progress|done|disputed
+    updated_by: Optional[str] = None
+
+from uuid import UUID
+from fastapi import HTTPException
+from sqlalchemy import select
+
+@app.post("/projects/{project_id}/review/status")
+def set_review_status(
+    project_id: UUID,
+    payload: ReviewUpdateRequest,
+    core: str = "hitl_test",
+):
+    """
+    Update review status for documents in a project.
+
+    - Validates document_ids belong to the project
+    - Upserts review rows in Postgres
+    - Updates derived state in Solr
+    """
+    status = payload.status.strip().lower()
+    if status not in {"unseen", "in_progress", "done", "disputed"}:
+        raise HTTPException(status_code=400, detail="invalid status")
+
+    db = SessionLocal()
+    try:
+        # ------------------------------------------------------------------
+        # Validate document IDs belong to this project (prevents FK crashes)
+        # ------------------------------------------------------------------
+        existing = set(
+            db.execute(
+                select(ProjectDocument.document_id)
+                .where(ProjectDocument.project_id == project_id)
+                .where(ProjectDocument.document_id.in_(payload.document_ids))
+            ).scalars().all()
+        )
+
+        missing = [d for d in payload.document_ids if d not in existing]
+        if missing:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": "some document_ids are not in this project",
+                    "missing": missing[:20],  # cap for safety
+                },
+            )
+
+        # ------------------------------------------------------------------
+        # Upsert review rows
+        # ------------------------------------------------------------------
+        n = 0
+        for did in payload.document_ids:
+            row = db.get(
+                ProjectDocumentReview,
+                {"project_id": project_id, "document_id": did},
+            )
+            if row:
+                row.status = status
+                row.updated_by = payload.updated_by
+                row.updated_at = datetime.utcnow()
+            else:
+                db.add(
+                    ProjectDocumentReview(
+                        project_id=project_id,
+                        document_id=did,
+                        status=status,
+                        updated_by=payload.updated_by,
+                    )
+                )
+            n += 1
+
+        db.commit()
+
+        # ------------------------------------------------------------------
+        # Update derived Solr state
+        # ------------------------------------------------------------------
+        solr_updates = [
+            {
+                "document_id_s": did,
+                "project_id": str(project_id),
+                "status": status,
+            }
+            for did in payload.document_ids
+        ]
+        solr_n = solr_update_review_status(core, solr_updates)
+
+        return {
+            "ok": True,
+            "project_id": str(project_id),
+            "status": status,
+            "rows_upserted": n,
+            "solr_docs_updated": solr_n,
+        }
+
+    finally:
+        db.close()
+
+
+# @app.post("/projects/{project_id}/review/status")
+# def set_review_status(
+#     project_id: UUID,
+#     payload: ReviewUpdateRequest,
+#     core: str = "hitl_test",
+# ):
+#     status = payload.status.strip().lower()
+#     if status not in {"unseen", "in_progress", "done", "disputed"}:
+#         raise HTTPException(400, "invalid status")
+#
+#     db = SessionLocal()
+#     try:
+#         # upsert rows in Postgres
+#         n = 0
+#         for did in payload.document_ids:
+#             row = db.get(ProjectDocumentReview, {"project_id": project_id, "document_id": did})
+#             if row:
+#                 row.status = status
+#                 row.updated_by = payload.updated_by
+#             else:
+#                 db.add(ProjectDocumentReview(
+#                     project_id=project_id,
+#                     document_id=did,
+#                     status=status,
+#                     updated_by=payload.updated_by,
+#                 ))
+#             n += 1
+#         db.commit()
+#
+#         # update Solr (derived)
+#         solr_updates = [{"document_id_s": did, "project_id": str(project_id), "status": status} for did in payload.document_ids]
+#         solr_n = solr_update_review_status(core, solr_updates)
+#
+#         return {
+#             "ok": True,
+#             "project_id": str(project_id),
+#             "status": status,
+#             "rows_upserted": n,
+#             "solr_docs_updated": solr_n,
+#         }
+#     finally:
+#         db.close()
+
+@app.get("/projects/{project_id}/review/stats")
+def project_review_stats(project_id: UUID):
+    db = SessionLocal()
+    try:
+        rows = db.execute(
+            select(ProjectDocumentReview.status, func.count())
+            .where(ProjectDocumentReview.project_id == project_id)
+            .group_by(ProjectDocumentReview.status)
+        ).all()
+
+        counts = {status: int(cnt) for status, cnt in rows}
+        for k in ["unseen", "in_progress", "done", "disputed"]:
+            counts.setdefault(k, 0)
+
+        return {"ok": True, "project_id": str(project_id), "counts": counts}
+    finally:
+        db.close()

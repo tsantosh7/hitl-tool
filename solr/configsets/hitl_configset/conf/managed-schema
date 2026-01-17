@@ -1,39 +1,21 @@
-<?xml version="1.0" encoding="UTF-8" ?>
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Solr managed schema - automatically generated - DO NOT EDIT -->
 <schema name="hitl" version="1.0">
-
-  <!-- Unique document key -->
   <uniqueKey>document_id_s</uniqueKey>
-
-  <!-- ===================================================== -->
-  <!-- FieldTypes (include Solr default-compatible aliases)   -->
-  <!-- ===================================================== -->
-
-  <!-- Keyword-ish string -->
-  <fieldType name="string" class="solr.StrField" sortMissingLast="true" docValues="true"/>
-  <fieldType name="strings" class="solr.StrField" sortMissingLast="true" docValues="true"/>
-
-  <!-- Boolean -->
   <fieldType name="boolean" class="solr.BoolField" sortMissingLast="true" docValues="true"/>
   <fieldType name="booleans" class="solr.BoolField" sortMissingLast="true" docValues="true"/>
-
-  <!-- Numeric point types (Solr defaults reference these plural names) -->
-  <fieldType name="pint"     class="solr.IntPointField"    docValues="true"/>
-  <fieldType name="pints"    class="solr.IntPointField"    docValues="true"/>
-
-  <fieldType name="plong"    class="solr.LongPointField"   docValues="true"/>
-  <fieldType name="plongs"   class="solr.LongPointField"   docValues="true"/>
-
-  <fieldType name="pfloat"   class="solr.FloatPointField"  docValues="true"/>
-  <fieldType name="pfloats"  class="solr.FloatPointField"  docValues="true"/>
-
-  <fieldType name="pdouble"  class="solr.DoublePointField" docValues="true"/>
-  <fieldType name="pdoubles" class="solr.DoublePointField" docValues="true"/>
-
-  <!-- Date -->
-  <fieldType name="pdate"  class="solr.DatePointField" docValues="true"/>
+  <fieldType name="pdate" class="solr.DatePointField" docValues="true"/>
   <fieldType name="pdates" class="solr.DatePointField" docValues="true"/>
-
-  <!-- General text -->
+  <fieldType name="pdouble" class="solr.DoublePointField" docValues="true"/>
+  <fieldType name="pdoubles" class="solr.DoublePointField" docValues="true"/>
+  <fieldType name="pfloat" class="solr.FloatPointField" docValues="true"/>
+  <fieldType name="pfloats" class="solr.FloatPointField" docValues="true"/>
+  <fieldType name="pint" class="solr.IntPointField" docValues="true"/>
+  <fieldType name="pints" class="solr.IntPointField" docValues="true"/>
+  <fieldType name="plong" class="solr.LongPointField" docValues="true"/>
+  <fieldType name="plongs" class="solr.LongPointField" docValues="true"/>
+  <fieldType name="string" class="solr.StrField" sortMissingLast="true" docValues="true"/>
+  <fieldType name="strings" class="solr.StrField" sortMissingLast="true" docValues="true"/>
   <fieldType name="text_general" class="solr.TextField" positionIncrementGap="100">
     <analyzer type="index">
       <tokenizer class="solr.StandardTokenizerFactory"/>
@@ -44,74 +26,38 @@
       <filter class="solr.LowerCaseFilterFactory"/>
     </analyzer>
   </fieldType>
-
-  <!-- ===================================================== -->
-  <!-- Required internal Solr field                          -->
-  <!-- ===================================================== -->
-  <!-- Solr requires _version_ to exist and be retrievable/searchable -->
-  <field name="_version_" type="plong" indexed="false" stored="false" docValues="true" multiValued="false"/>
-
-  <!-- ===================================================== -->
-  <!-- Your HITL fields                                      -->
-  <!-- ===================================================== -->
-
-  <field name="document_id_s"   type="string"       indexed="true" stored="true" required="true"  multiValued="false"/>
-  <field name="canonical_url_s" type="string"       indexed="true" stored="true" />
-
-  <field name="title_txt"       type="text_general" indexed="true" stored="true" />
-  <field name="excerpt_txt"     type="text_general" indexed="true" stored="true" />
-  <field name="body_txt"        type="text_general" indexed="true" stored="false"/>
-
-  <field name="published_dt"    type="pdate"        indexed="true" stored="true" />
-
-  <field name="doc_type_s"      type="string"       indexed="true" stored="true" docValues="true"/>
-  <field name="source_s"        type="string"       indexed="true" stored="true" docValues="true"/>
-  <field name="judges_ss"       type="string"       indexed="true" stored="true" multiValued="true" docValues="true"/>
-
-  <field name="has_human_b"     type="boolean"      indexed="true" stored="true" default="false"/>
-  <field name="has_model_b"     type="boolean"      indexed="true" stored="true" default="false"/>
-  <field name="has_any_span_b"  type="boolean"      indexed="true" stored="true" default="false"/>
-
-  <field name="schema_versions_ss" type="string" indexed="true" stored="true" multiValued="true" docValues="true"/>
-  <field name="ingested_dt"        type="pdate"  indexed="true" stored="true"/>
-
-  <field name="rand_f"          type="pfloat"       indexed="true" stored="true" />
-
-  <!-- Optional: helpful catch-all field many Solr UIs/tools expect -->
-  <field name="_text_"          type="text_general" indexed="true" stored="false" multiValued="true"/>
-
-  <!-- ===================================================== -->
-  <!-- Domain-specific (legal) metadata - optional           -->
-  <!-- ===================================================== -->
-
-  <field name="citation_s"   type="string" indexed="true" stored="true" docValues="true"/>
-  <field name="signature_s"  type="string" indexed="true" stored="true" docValues="true"/>
-  <field name="xml_uri_s"    type="string" indexed="true" stored="true" docValues="true"/>
-  <field name="file_name_s"  type="string" indexed="true" stored="true" docValues="true"/>
-
-  <field name="case_numbers_ss"        type="string" indexed="true" stored="true" multiValued="true" docValues="true"/>
-  <field name="citation_references_ss" type="string" indexed="true" stored="true" multiValued="true" docValues="true"/>
-  <field name="legislation_ss"         type="string" indexed="true" stored="true" multiValued="true" docValues="true"/>
-
-  <field name="appeal_type_s"    type="string" indexed="true" stored="true" docValues="true"/>
-  <field name="appeal_outcome_s" type="string" indexed="true" stored="true" docValues="true"/>
-  
-  <field name="project_ids_ss" type="string" indexed="true" stored="true" multiValued="true" docValues="true"/>
-
-  <!-- ===================================================== -->
-  <!-- Annotation Codes fields                                           -->
-  <!-- ===================================================== -->
-
-<field name="codes_v1_ss" type="string" indexed="true" stored="true" multiValued="true"/>
-<field name="codes_ext_ss" type="string" indexed="true" stored="true" multiValued="true"/>
-<field name="codes_all_ss" type="string" indexed="true" stored="true" multiValued="true"/>
-
-  <!-- ===================================================== -->
-  <!-- Copy fields                                           -->
-  <!-- ===================================================== -->
-
-  <copyField source="title_txt"   dest="body_txt"/>
+  <field name="_text_" type="text_general" multiValued="true" indexed="true" stored="false"/>
+  <field name="_version_" type="plong" docValues="true" multiValued="false" indexed="false" stored="false"/>
+  <field name="appeal_outcome_s" type="string" docValues="true" indexed="true" stored="true"/>
+  <field name="appeal_type_s" type="string" docValues="true" indexed="true" stored="true"/>
+  <field name="body_txt" type="text_general" indexed="true" stored="false"/>
+  <field name="canonical_url_s" type="string" indexed="true" stored="true"/>
+  <field name="case_numbers_ss" type="string" docValues="true" multiValued="true" indexed="true" stored="true"/>
+  <field name="citation_references_ss" type="string" docValues="true" multiValued="true" indexed="true" stored="true"/>
+  <field name="citation_s" type="string" docValues="true" indexed="true" stored="true"/>
+  <field name="codes_all_ss" type="string" multiValued="true" indexed="true" stored="true"/>
+  <field name="codes_ext_ss" type="string" multiValued="true" indexed="true" stored="true"/>
+  <field name="codes_v1_ss" type="string" multiValued="true" indexed="true" stored="true"/>
+  <field name="doc_type_s" type="string" docValues="true" indexed="true" stored="true"/>
+  <field name="document_id_s" type="string" multiValued="false" indexed="true" required="true" stored="true"/>
+  <field name="excerpt_txt" type="text_general" indexed="true" stored="true"/>
+  <field name="file_name_s" type="string" docValues="true" indexed="true" stored="true"/>
+  <field name="has_any_span_b" type="boolean" default="false" indexed="true" stored="true"/>
+  <field name="has_human_b" type="boolean" default="false" indexed="true" stored="true"/>
+  <field name="has_model_b" type="boolean" default="false" indexed="true" stored="true"/>
+  <field name="ingested_dt" type="pdate" indexed="true" stored="true"/>
+  <field name="judges_ss" type="string" docValues="true" multiValued="true" indexed="true" stored="true"/>
+  <field name="legislation_ss" type="string" docValues="true" multiValued="true" indexed="true" stored="true"/>
+  <field name="project_ids_ss" type="string" docValues="true" multiValued="true" indexed="true" stored="true"/>
+  <field name="published_dt" type="pdate" indexed="true" stored="true"/>
+  <field name="rand_f" type="pfloat" indexed="true" stored="true"/>
+  <field name="review_status_by_project_ss" type="string" docValues="true" multiValued="true" indexed="true" stored="true"/>
+  <field name="schema_versions_ss" type="string" docValues="true" multiValued="true" indexed="true" stored="true"/>
+  <field name="signature_s" type="string" docValues="true" indexed="true" stored="true"/>
+  <field name="source_s" type="string" docValues="true" indexed="true" stored="true"/>
+  <field name="title_txt" type="text_general" indexed="true" stored="true"/>
+  <field name="xml_uri_s" type="string" docValues="true" indexed="true" stored="true"/>
+  <copyField source="body_txt" dest="_text_"/>
   <copyField source="excerpt_txt" dest="body_txt"/>
-  <copyField source="body_txt"    dest="_text_"/>
-
+  <copyField source="title_txt" dest="body_txt"/>
 </schema>

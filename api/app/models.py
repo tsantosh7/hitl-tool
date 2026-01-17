@@ -19,6 +19,10 @@ from .db import Base
 from sqlalchemy import UniqueConstraint
 from pydantic import BaseModel, Field
 
+from sqlalchemy import Column, String, DateTime, ForeignKey
+from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.sql import func
+
 
 class Team(Base):
     __tablename__ = "teams"
@@ -152,3 +156,17 @@ class CodeAlias(Base):
     __table_args__ = (
         UniqueConstraint("alias", name="uq_code_alias"),
     )
+
+
+
+
+
+class ProjectDocumentReview(Base):
+    __tablename__ = "project_document_reviews"
+
+    project_id = Column(UUID(as_uuid=True), ForeignKey("projects.project_id"), primary_key=True)
+    document_id = Column(String, ForeignKey("documents.document_id"), primary_key=True)
+
+    status = Column(String, nullable=False, default="unseen")  # unseen|in_progress|done|disputed
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+    updated_by = Column(String, nullable=True)
