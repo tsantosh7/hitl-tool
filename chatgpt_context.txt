@@ -1,0 +1,684 @@
+### DIRECTORY TREE ###
+.
+├── api
+│   ├── app
+│   │   ├── db.py
+│   │   ├── init_db.py
+│   │   ├── main.py
+│   │   └── models.py
+│   ├── Dockerfile
+│   └── requirements.txt
+├── chatgpt_context.txt
+├── data
+│   └── normalised_data.jsonl
+├── docker-compose.yml
+├── run_ingestion.sh
+├── scripts
+│   ├── ingest_jsonl.py
+│   └── normalise_data_keys_json.py
+├── solr
+│   └── configsets
+│       └── hitl_configset
+│           └── conf
+│               ├── lang
+│               │   ├── contractions_ca.txt
+│               │   ├── contractions_fr.txt
+│               │   ├── contractions_ga.txt
+│               │   ├── contractions_it.txt
+│               │   ├── hyphenations_ga.txt
+│               │   ├── stemdict_nl.txt
+│               │   ├── stoptags_ja.txt
+│               │   ├── stopwords_ar.txt
+│               │   ├── stopwords_bg.txt
+│               │   ├── stopwords_ca.txt
+│               │   ├── stopwords_cz.txt
+│               │   ├── stopwords_da.txt
+│               │   ├── stopwords_de.txt
+│               │   ├── stopwords_el.txt
+│               │   ├── stopwords_en.txt
+│               │   ├── stopwords_es.txt
+│               │   ├── stopwords_et.txt
+│               │   ├── stopwords_eu.txt
+│               │   ├── stopwords_fa.txt
+│               │   ├── stopwords_fi.txt
+│               │   ├── stopwords_fr.txt
+│               │   ├── stopwords_ga.txt
+│               │   ├── stopwords_gl.txt
+│               │   ├── stopwords_hi.txt
+│               │   ├── stopwords_hu.txt
+│               │   ├── stopwords_hy.txt
+│               │   ├── stopwords_id.txt
+│               │   ├── stopwords_it.txt
+│               │   ├── stopwords_ja.txt
+│               │   ├── stopwords_lv.txt
+│               │   ├── stopwords_nl.txt
+│               │   ├── stopwords_no.txt
+│               │   ├── stopwords_pt.txt
+│               │   ├── stopwords_ro.txt
+│               │   ├── stopwords_ru.txt
+│               │   ├── stopwords_sv.txt
+│               │   ├── stopwords_th.txt
+│               │   ├── stopwords_tr.txt
+│               │   └── userdict_ja.txt
+│               ├── managed-schema
+│               ├── managed-schema.xml
+│               ├── protwords.txt
+│               ├── solrconfig.xml
+│               ├── stopwords.txt
+│               └── synonyms.txt
+└── worker
+    ├── Dockerfile
+    ├── requirements.txt
+    └── worker.py
+
+11 directories, 60 files
+
+### FILE CONTENTS ###
+
+===== ./scripts/normalise_data_keys_json.py =====
+
+import json
+from typing import Dict, Any
+
+
+def map_record_to_normalised(record: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Map a single source record into the normalised schema.
+    """
+
+    return {
+        "document_id": record.get("document_id") or record.get("_id"),
+        "canonical_url": record.get("canonical_url") or record.get("uri"),
+        "published_date": record.get("published_date") or record.get("publicationDate"),
+        "doc_type": record.get("type") or record.get("court"),
+        "title": record.get("citation"),
+        "excerpt": record.get("excerpt") or record.get("summary"),
+        "content_text": record.get("content_text") or record.get("content"),
+        "source": record.get("source"),
+
+        "metadata": {
+            "citation": record.get("citation"),
+            "signature": record.get("signature"),
+            "xml_uri": record.get("xml_uri"),
+            "file_name": record.get("file_name"),
+            "judges": record.get("judges"),
+            "caseNumbers": record.get("caseNumbers"),
+            "citation_references": record.get("citation_references"),
+            "legislation": record.get("legislation"),
+            "appeal_type": record.get("appeal_type"),
+            "appeal_outcome": record.get("appeal_outcome"),
+        }
+    }
+
+
+root_path = "/home/stirunag/work/github/JuDDGES/nbs/Data/england-wales/"
+INPUT_PATH = root_path + "Instruction Data/england_wales_data_refined_7.jsonl"
+OUTPUT_PATH = root_path + "Instruction Data/normalised_data.jsonl"
+
+
+def normalise_jsonl(input_path: str, output_path: str) -> None:
+    total_docs = 0
+    non_null_content = 0
+    non_null_excerpt = 0
+    non_null_title = 0
+
+    with open(input_path, "r", encoding="utf-8") as infile, \
+         open(output_path, "w", encoding="utf-8") as outfile:
+
+        for line_number, line in enumerate(infile, start=1):
+            if not line.strip():
+                continue
+
+            try:
+                source_record = json.loads(line)
+            except json.JSONDecodeError as e:
+                print(f"Skipping invalid JSON on line {line_number}: {e}")
+                continue
+
+            normalised_record = map_record_to_normalised(source_record)
+            outfile.write(json.dumps(normalised_record, ensure_ascii=False) + "\n")
+
+            total_docs += 1
+
+            if normalised_record.get("content_text"):
+                non_null_content += 1
+            if normalised_record.get("excerpt"):
+                non_null_excerpt += 1
+            if normalised_record.get("title"):
+                non_null_title += 1
+
+    # Summary stats
+    print("Normalisation complete")
+    print(f"Total documents: {total_docs}")
+    print(
+        f"content_text present: {non_null_content} "
+        f"({(non_null_content / total_docs * 100):.2f}%)"
+        if total_docs else "content_text present: 0"
+    )
+    print(
+        f"excerpt present: {non_null_excerpt} "
+        f"({(non_null_excerpt / total_docs * 100):.2f}%)"
+        if total_docs else "excerpt present: 0"
+    )
+    print(
+        f"title present: {non_null_title} "
+        f"({(non_null_title / total_docs * 100):.2f}%)"
+        if total_docs else "title present: 0"
+    )
+
+
+if __name__ == "__main__":
+    normalise_jsonl(INPUT_PATH, OUTPUT_PATH)
+
+===== ./scripts/ingest_jsonl.py =====
+
+import json
+import sys
+import time
+import argparse
+import requests
+
+def chunks(iterable, n):
+    buf = []
+    for item in iterable:
+        buf.append(item)
+        if len(buf) >= n:
+            yield buf
+            buf = []
+    if buf:
+        yield buf
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--file", required=True)
+    ap.add_argument("--api", default="http://localhost:8000")
+    ap.add_argument("--core", required=True)
+    ap.add_argument("--batch", type=int, default=250)
+    ap.add_argument("--commit-each", action="store_true")
+    ap.add_argument("--commit-within-ms", type=int, default=10000)
+    ap.add_argument("--sleep", type=float, default=0.0)
+    args = ap.parse_args()
+
+    url = f"{args.api.rstrip('/')}/ingest_batch/{args.core}"
+    total = 0
+
+    with open(args.file, "r", encoding="utf-8") as f:
+        def line_iter():
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                yield json.loads(line)
+
+        for batch_docs in chunks(line_iter(), args.batch):
+            payload = {
+                "docs": batch_docs,
+                "commit": bool(args.commit_each),
+                "commit_within_ms": args.commit_within_ms,
+            }
+            r = requests.post(url, json=payload, timeout=180)
+            if r.status_code >= 300:
+                print("ERROR:", r.status_code, r.text[:1000], file=sys.stderr)
+                sys.exit(1)
+
+            total += len(batch_docs)
+            print(f"Indexed so far: {total}")
+
+            if args.sleep > 0:
+                time.sleep(args.sleep)
+
+    if not args.commit_each:
+        r = requests.post(f"{args.api.rstrip('/')}/solr/{args.core}/commit", timeout=60)
+        r.raise_for_status()
+        print("Committed.")
+
+    print("Done. Total:", total)
+
+if __name__ == "__main__":
+    main()
+
+===== ./run_ingestion.sh =====
+
+#!/usr/bin/env bash
+source ~/environments/juddges_env/bin/activate
+
+python scripts/ingest_jsonl.py \
+  --file /home/stirunag/work/github/hitl-tool/data/normalised_data.jsonl \
+  --core hitl_test \
+  --batch 250
+
+===== ./api/app/models.py =====
+
+import uuid
+from sqlalchemy import Column, String, Date, Text, JSON, ForeignKey
+from sqlalchemy.dialects.postgresql import UUID
+from .db import Base
+
+class Team(Base):
+    __tablename__ = "teams"
+    team_id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    name = Column(String, nullable=False)
+
+class Project(Base):
+    __tablename__ = "projects"
+    project_id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    team_id = Column(UUID(as_uuid=True), ForeignKey("teams.team_id"), nullable=False)
+    name = Column(String, nullable=False)
+
+class Document(Base):
+    __tablename__ = "documents"
+    document_id = Column(String, primary_key=True)
+    canonical_url = Column(String, unique=True, nullable=False)
+    published_date = Column(Date, nullable=True)
+    doc_type = Column(String, nullable=True)
+    title = Column(String, nullable=True)
+    excerpt = Column(Text, nullable=True)
+    content_text = Column(Text, nullable=False)
+    source = Column(String, nullable=True)
+    doc_metadata = Column(JSON, nullable=False, default=dict)
+
+===== ./api/app/main.py =====
+
+# api/app/main.py
+import os
+import requests
+from datetime import datetime, date
+from typing import Any, Dict, List, Optional
+
+from fastapi import FastAPI, HTTPException, Query
+from pydantic import BaseModel, Field, HttpUrl
+from sqlalchemy import select, func
+
+from .db import SessionLocal
+from .init_db import init
+from .models import Team, Project, Document
+
+SOLR_BASE_URL = os.environ["SOLR_BASE_URL"]
+
+app = FastAPI()
+
+
+# -----------------------------
+# Startup
+# -----------------------------
+@app.on_event("startup")
+def on_startup():
+    init()
+
+
+@app.get("/health")
+def health():
+    return {"ok": True, "solr": SOLR_BASE_URL}
+
+
+# -----------------------------
+# Helpers
+# -----------------------------
+def solr_core_url(core: str) -> str:
+    return f"{SOLR_BASE_URL.rstrip('/')}/{core}"
+
+
+def solr_admin_url() -> str:
+    return f"{SOLR_BASE_URL.rstrip('/')}/admin/cores"
+
+
+def utc_now_z() -> str:
+    return datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+
+
+def date_to_solr_dt(d: Optional[date]) -> Optional[str]:
+    if not d:
+        return None
+    return f"{d.isoformat()}T00:00:00Z"
+
+
+def extract_judges(metadata: Dict[str, Any]) -> List[str]:
+    if not isinstance(metadata, dict):
+        return []
+    j = metadata.get("judges")
+    if isinstance(j, list):
+        return [str(x).strip() for x in j if str(x).strip()]
+    return []
+
+
+def solr_create_core(core_name: str, config_set: str = "hitl_configset") -> dict:
+    params = {"action": "CREATE", "name": core_name, "configSet": config_set, "wt": "json"}
+    r = requests.get(solr_admin_url(), params=params, timeout=60)
+    if r.status_code >= 300:
+        raise HTTPException(status_code=500, detail=f"Solr core create failed: {r.text[:800]}")
+    return r.json()
+
+
+def solr_unload_core(core_name: str, delete_index=True, delete_data=True, delete_instance=True) -> dict:
+    params = {
+        "action": "UNLOAD",
+        "core": core_name,
+        "deleteIndex": str(delete_index).lower(),
+        "deleteDataDir": str(delete_data).lower(),
+        "deleteInstanceDir": str(delete_instance).lower(),
+        "wt": "json",
+    }
+    r = requests.get(solr_admin_url(), params=params, timeout=60)
+    if r.status_code >= 300:
+        raise HTTPException(status_code=500, detail=f"Solr core unload failed: {r.text[:800]}")
+    return r.json()
+
+
+def solr_add_docs(core: str, docs: List[dict], commit: bool = True, commit_within_ms: Optional[int] = None) -> None:
+    params: Dict[str, str] = {}
+    if commit:
+        params["commit"] = "true"
+    if commit_within_ms is not None:
+        params["commitWithin"] = str(commit_within_ms)
+    r = requests.post(f"{solr_core_url(core)}/update", params=params, json=docs, timeout=180)
+    if r.status_code >= 300:
+        raise HTTPException(status_code=500, detail=f"Solr add failed: {r.status_code} {r.text[:800]}")
+
+
+def solr_delete_by_id(core: str, doc_id: str, commit: bool = True) -> None:
+    payload = {"delete": {"id": doc_id}}
+    params = {"commit": "true"} if commit else {}
+    r = requests.post(f"{solr_core_url(core)}/update", params=params, json=payload, timeout=60)
+    if r.status_code >= 300:
+        raise HTTPException(status_code=500, detail=f"Solr delete failed: {r.status_code} {r.text[:800]}")
+
+
+def solr_commit(core: str) -> None:
+    r = requests.post(f"{solr_core_url(core)}/update", params={"commit": "true"}, json={}, timeout=60)
+    if r.status_code >= 300:
+        raise HTTPException(status_code=500, detail=f"Solr commit failed: {r.status_code} {r.text[:800]}")
+
+
+def to_solr_doc(payload: "IngestDocumentIn") -> dict:
+    judges = extract_judges(payload.doc_metadata or {})
+    published_dt = date_to_solr_dt(payload.published_date)
+
+    solr_doc = {
+        "document_id_s": payload.document_id,
+        "canonical_url_s": str(payload.canonical_url),
+        "title_txt": payload.title or "",
+        "excerpt_txt": payload.excerpt or "",
+        "doc_type_s": payload.doc_type or "",
+        "source_s": payload.source or "",
+        "judges_ss": judges,
+        "schema_versions_ss": [payload.schema_version],
+        "ingested_dt": utc_now_z(),
+        "has_human_b": payload.has_human,
+        "has_model_b": payload.has_model,
+        "has_any_span_b": payload.has_any_span,
+        "rand_f": float(payload.rand_f) if payload.rand_f is not None else 0.0,
+    }
+    if published_dt:
+        solr_doc["published_dt"] = published_dt
+    return solr_doc
+
+
+def row_to_ingest_model(row: Document, schema_version: str = "hitl-v1") -> "IngestDocumentIn":
+    # canonical_url is stored as string in DB; IngestDocumentIn expects HttpUrl,
+    # but Pydantic will validate from str.
+    return IngestDocumentIn(
+        document_id=row.document_id,
+        canonical_url=row.canonical_url,
+        published_date=row.published_date,
+        doc_type=row.doc_type,
+        title=row.title,
+        excerpt=row.excerpt,
+        content_text=row.content_text,
+        source=row.source,
+        doc_metadata=row.doc_metadata or {},
+        schema_version=schema_version,
+        has_human=False,
+        has_model=False,
+        has_any_span=False,
+        rand_f=None,
+    )
+
+
+# -----------------------------
+# Pydantic models
+# -----------------------------
+class CreateProjectIn(BaseModel):
+    team_name: str
+    project_name: str
+
+
+class CreateProjectOut(BaseModel):
+    team_id: str
+    project_id: str
+    solr_core: str
+
+
+class IngestDocumentIn(BaseModel):
+    document_id: str
+    canonical_url: HttpUrl
+
+    published_date: Optional[date] = None
+    doc_type: Optional[str] = None
+    title: Optional[str] = None
+    excerpt: Optional[str] = None
+    content_text: str
+    source: Optional[str] = None
+    doc_metadata: Dict[str, Any] = Field(default_factory=dict)
+
+    schema_version: str = "hitl-v1"
+    has_human: bool = False
+    has_model: bool = False
+    has_any_span: bool = False
+    rand_f: Optional[float] = None
+
+
+class IngestBatchIn(BaseModel):
+    docs: List[IngestDocumentIn]
+    commit: bool = True
+    commit_within_ms: Optional[int] = None
+
+
+class UpdateDocIn(BaseModel):
+    canonical_url: Optional[HttpUrl] = None
+    published_date: Optional[date] = None
+    doc_type: Optional[str] = None
+    title: Optional[str] = None
+    excerpt: Optional[str] = None
+    content_text: Optional[str] = None
+    source: Optional[str] = None
+    doc_metadata: Optional[Dict[str, Any]] = None
+
+    schema_version: Optional[str] = None
+    has_human: Optional[bool] = None
+    has_model: Optional[bool] = None
+    has_any_span: Optional[bool] = None
+    rand_f: Optional[float] = None
+
+    reindex_solr: bool = True
+
+
+class SearchRequest(BaseModel):
+    q: str = "*:*"
+    start: int = 0
+    rows: int = 10
+
+    # Default query field: your schema uses body_txt as unified search field.
+    df: str = "body_txt"
+
+    # Return fields
+    fl: Optional[str] = None  # e.g. "document_id_s,title_txt,canonical_url_s"
+
+    # Sorting
+    sort: Optional[str] = None  # e.g. "published_dt desc"
+
+    # Filter queries (Solr fq)
+    fqs: List[str] = Field(default_factory=list)
+    # Example:
+    # ["source_s:nationalarchives", "doc_type_s:crown_court", "published_dt:[2000-01-01T00:00:00Z TO *]"]
+
+    # Facets (simple field facets)
+    facet: bool = False
+    facet_fields: List[str] = Field(default_factory=list)
+    facet_limit: int = 20
+    facet_mincount: int = 1
+
+
+class ReindexRequest(BaseModel):
+    batch_size: int = 250
+    commit_within_ms: int = 10_000
+    commit_each_batch: bool = True
+    schema_version: str = "hitl-v1"
+
+
+# -----------------------------
+# Projects
+# -----------------------------
+@app.post("/projects", response_model=CreateProjectOut)
+def create_project(payload: CreateProjectIn):
+    db = SessionLocal()
+    try:
+        team = Team(name=payload.team_name)
+        db.add(team)
+        db.flush()
+
+        proj = Project(team_id=team.team_id, name=payload.project_name)
+        db.add(proj)
+        db.commit()
+
+        core_name = f"proj_{proj.project_id}"
+        solr_create_core(core_name, config_set="hitl_configset")
+
+        return CreateProjectOut(
+            team_id=str(team.team_id),
+            project_id=str(proj.project_id),
+            solr_core=core_name,
+        )
+    finally:
+        db.close()
+
+
+@app.delete("/projects/{project_id}")
+def delete_project(project_id: str, delete_solr_core: bool = True):
+    db = SessionLocal()
+    try:
+        proj = db.get(Project, project_id)
+        if not proj:
+            raise HTTPException(status_code=404, detail="Project not found")
+
+        core_name = f"proj_{proj.project_id}"
+        db.delete(proj)
+        db.commit()
+
+        if delete_solr_core:
+            solr_unload_core(core_name, delete_index=True, delete_data=True, delete_instance=True)
+
+        return {"ok": True, "project_id": project_id, "solr_core": core_name, "deleted_solr_core": delete_solr_core}
+    finally:
+        db.close()
+
+
+# -----------------------------
+# Ingest endpoints (normalized JSON)
+# -----------------------------
+@app.post("/ingest/{core}")
+def ingest_one(core: str, payload: IngestDocumentIn):
+    db = SessionLocal()
+    try:
+
+===== ./api/app/init_db.py =====
+
+import time
+from sqlalchemy.exc import OperationalError
+from .db import Base, engine
+from . import models  # noqa: F401
+
+def init(retries: int = 10, delay: int = 2):
+    for attempt in range(retries):
+        try:
+            Base.metadata.create_all(bind=engine)
+            return
+        except OperationalError as e:
+            if attempt == retries - 1:
+                raise
+            print(f"DB not ready, retrying ({attempt + 1}/{retries})...")
+            time.sleep(delay)
+
+===== ./api/app/db.py =====
+
+import os
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker, declarative_base
+
+DATABASE_URL = os.environ["DATABASE_URL"]
+
+engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+
+Base = declarative_base()
+
+===== ./docker-compose.yml =====
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: corpusdb
+      POSTGRES_USER: corpus
+      POSTGRES_PASSWORD: corpuspass
+    ports: ["5432:5432"]
+    volumes: ["pgdata:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U corpus -d corpusdb"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7
+    ports: ["6379:6379"]
+
+  solr:
+    image: solr:9
+    ports: ["8983:8983"]
+    volumes:
+      - solrdata:/var/solr
+      - ./solr/configsets:/var/solr/data/configsets
+    command: ["solr", "-f"]
+
+  api:
+    build: ./api
+    environment:
+      DATABASE_URL: postgresql+psycopg://corpus:corpuspass@postgres:5432/corpusdb
+      SOLR_BASE_URL: http://solr:8983/solr
+      REDIS_URL: redis://redis:6379/0
+      FAISS_DIR: /data/faiss
+    volumes:
+      - faissdata:/data/faiss
+    ports: ["8000:8000"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      solr:
+        condition: service_started
+
+  worker:
+    build: ./worker
+    environment:
+      DATABASE_URL: postgresql+psycopg://corpus:corpuspass@postgres:5432/corpusdb
+      SOLR_BASE_URL: http://solr:8983/solr
+      REDIS_URL: redis://redis:6379/0
+      FAISS_DIR: /data/faiss
+      EMBEDDING_MODEL: all-MiniLM-L6-v2
+    volumes:
+      - faissdata:/data/faiss
+    depends_on: [postgres, redis, solr]
+    command: ["python", "worker.py"]
+
+volumes:
+  pgdata:
+  solrdata:
+  faissdata:
+
+===== ./worker/worker.py =====
+
+import os
+print("Worker up.")
+print("FAISS_DIR:", os.getenv("FAISS_DIR"))
+print("EMBEDDING_MODEL:", os.getenv("EMBEDDING_MODEL"))

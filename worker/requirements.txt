@@ -1,0 +1,4 @@
+psycopg[binary]==3.2.1
+sentence-transformers==2.7.0
+faiss-cpu==1.8.0
+numpy==1.26.4
