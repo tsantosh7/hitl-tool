@@ -13,8 +13,6 @@ __pycache__/
 data/hypothesis/
 
 
-
-
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
