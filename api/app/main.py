@@ -20,6 +20,12 @@ from datetime import timezone
 from dateutil import parser as dtparser
 from collections import defaultdict
 from typing import Optional
+from uuid import UUID
+import csv
+import io
+from fastapi.responses import StreamingResponse
+from sqlalchemy import func
+
 
 from .db import SessionLocal
 from .init_db import init
@@ -150,7 +156,7 @@ def chunked(xs: List[Any], n: int) -> Iterable[List[Any]]:
 
 
 # ------------------------------------------------------------------------------
-# Annotations helpers
+# Annotations helpers - code normalisation
 # ------------------------------------------------------------------------------
 
 V1_CODES_PATH = os.getenv("V1_CODES_PATH", "/app/data/schema_v1_codes.json")
@@ -391,6 +397,81 @@ def seed_code_aliases(db):
         db.add(CodeAlias(alias=alias, code=canonical))
 
     db.commit()
+
+
+#######################################################
+# CSV export helpers
+#######################################################
+def iso_z(dt: Optional[datetime]) -> Optional[str]:
+    if not dt:
+        return None
+    dtu = parse_dt_utc(dt)
+    return dtu.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def resolve_codes_for_tags_cached(
+    tags: list[str],
+    canon_version: dict[str, str],
+    alias_to_canon: dict[str, str],
+    key_to_canon: dict[str, str],
+) -> list[tuple[str, str]]:
+    """
+    Resolve tags -> list of (canonical_code, code_version).
+    Uses your same normalization rules as sync.
+    Only returns registered active codes.
+    """
+    out: list[tuple[str, str]] = []
+    for t in (tags or []):
+        canonical = resolve_tag_to_canonical(
+            t,
+            canon_version,
+            alias_to_canon,
+            key_to_canon,
+        )
+        if not canonical:
+            continue
+        ver = canon_version.get(canonical)
+        if not ver:
+            continue
+        out.append((canonical, ver))
+    return out
+
+
+def iter_project_document_ids(
+    db,
+    project_id: str,
+    document_id: Optional[str] = None,
+    document_ids: Optional[str] = None,
+) -> list[str]:
+    """
+    Returns the target document_ids (scoped to the project membership).
+    project_id is UUID in DB, so we normalize it here.
+
+    - If document_id provided: verifies it belongs to project
+    - If document_ids provided: intersects with project docs
+    - Else: all project docs
+    """
+    try:
+        pid = UUID(str(project_id))
+    except Exception:
+        raise HTTPException(400, "project_id must be a valid UUID")
+
+    proj_doc_ids = db.execute(
+        select(ProjectDocument.document_id).where(ProjectDocument.project_id == pid)
+    ).scalars().all()
+    proj_set = set(proj_doc_ids)
+
+    if document_id:
+        if document_id not in proj_set:
+            return []
+        return [document_id]
+
+    if document_ids:
+        requested = {d.strip() for d in document_ids.split(",") if d.strip()}
+        return sorted(list(proj_set & requested))
+
+    return sorted(list(proj_set))
+
 
 # ------------------------------------------------------------------------------
 # Solr helpers
@@ -1563,5 +1644,220 @@ def deactivate_code(code: str):
         row.is_active = False
         db.commit()
         return {"ok": True, "code": code}
+    finally:
+        db.close()
+
+
+################ CSV export end point##############
+# 4) How to run it
+# Export all docs in a project
+# curl -L -o out.csv "http://localhost:8000/export/csv?project_id=YOUR_PROJECT_ID"
+#
+# Export a single document
+# curl -L -o out.csv "http://localhost:8000/export/csv?project_id=YOUR_PROJECT_ID&document_id=DOC_ID"
+#
+# Export selected docs
+# curl -L -o out.csv "http://localhost:8000/export/csv?project_id=YOUR_PROJECT_ID&document_ids=DOC1,DOC2,DOC3"
+#
+# Export only one code (by canonical name or alias/variant)
+# curl -L -o out.csv "http://localhost:8000/export/csv?project_id=YOUR_PROJECT_ID&code=Confess/Plead"
+#
+# Export only v1 codes
+# curl -L -o out.csv ("http://localhost:8000/export/csv?project_id=YOUR_PROJECT_ID&version=v1"
+
+################################################################################################
+@app.get("/export/csv")
+def export_csv(
+    project_id: UUID,
+    core: str = "hitl_test",
+    document_id: Optional[str] = None,
+    document_ids: Optional[str] = None,
+    code: Optional[str] = None,
+    version: str = "all",
+    source: str = "human",
+    include_annotators: bool = False,
+):
+    """
+    Production-grade long/tidy export:
+      one row per (document_id, code)
+
+    Values:
+      - value: latest non-empty annotation.text
+      - values: JSON array string of all unique non-empty texts
+      - has_span + span_examples
+    """
+    if source not in {"human", "all"}:
+        # model not implemented yet
+        raise HTTPException(400, "source supports: human|all (model export not implemented yet)")
+
+    if version not in {"v1", "ext", "all"}:
+        raise HTTPException(400, "version must be v1|ext|all")
+
+    db = SessionLocal()
+
+    try:
+        # 1) determine doc set (project-scoped)
+        doc_ids = iter_project_document_ids(db, str(project_id), document_id=document_id, document_ids=document_ids)
+        if not doc_ids:
+            raise HTTPException(404, "No documents matched (check project membership and document_id(s))")
+
+        # 2) preload doc_id -> canonical_url
+        doc_rows = db.execute(
+            select(Document.document_id, Document.canonical_url).where(Document.document_id.in_(doc_ids))
+        ).all()
+        doc_url = {d: u for (d, u) in doc_rows}
+
+        # 3) preload code maps ONCE (fast; avoids DB hits per annotation)
+        canon_version, alias_to_canon, key_to_canon = load_code_maps(db)
+
+        # If caller provided `code=...`, normalize it to canonical too
+        code_filter: Optional[str] = None
+        if code:
+            cf = resolve_tag_to_canonical(code, canon_version, alias_to_canon, key_to_canon)
+            if not cf:
+                # if they asked for an unknown/unregistered code, return empty CSV (header only)
+                code_filter = "__NO_MATCH__"
+            else:
+                code_filter = cf
+
+        # 4) stream CSV
+        headers = [
+            "project_id",
+            "document_id",
+            "canonical_url",
+            "code",
+            "code_version",
+            "source",
+            "value",
+            "value_mode",
+            "values",
+            "n_values",
+            "has_span",
+            "span_examples",
+            "n_annotations",
+            "latest_updated",
+        ]
+        if include_annotators:
+            headers.append("annotators")
+
+        def gen():
+            buf = io.StringIO()
+            w = csv.DictWriter(buf, fieldnames=headers)
+            w.writeheader()
+            yield buf.getvalue()
+            buf.seek(0)
+            buf.truncate(0)
+
+            # Aggregation structure:
+            # (doc_id, code) -> metrics
+            agg: dict[tuple[str, str], dict] = {}
+
+            # Pull annotations for docs in chunks
+            stmt = select(
+                HypothesisAnnotation.document_id,
+                HypothesisAnnotation.tags,
+                HypothesisAnnotation.text,
+                HypothesisAnnotation.exact,
+                HypothesisAnnotation.user,
+                HypothesisAnnotation.updated,
+            ).where(HypothesisAnnotation.document_id.in_(doc_ids))
+
+            # stream rows from DB
+            for doc_id, tags, text, exact, user, updated in db.execute(stmt).yield_per(5000):
+                if not doc_id:
+                    continue
+
+                resolved = resolve_codes_for_tags_cached(tags or [], canon_version, alias_to_canon, key_to_canon)
+                if not resolved:
+                    continue
+
+                # normalize the value
+                val = (text or "").strip()
+                upd = parse_dt_utc(updated)
+
+                for canonical_code, code_ver in resolved:
+                    if code_filter and canonical_code != code_filter:
+                        continue
+                    if version != "all" and code_ver != version:
+                        continue
+
+                    key = (doc_id, canonical_code)
+                    rec = agg.get(key)
+                    if not rec:
+                        rec = {
+                            "code_version": code_ver,
+                            "n_annotations": 0,
+                            "has_span": False,
+                            "span_examples": [],
+                            "values_set": set(),
+                            "latest_value": None,      # str
+                            "latest_updated": None,    # datetime
+                            "annotators": set(),
+                        }
+                        agg[key] = rec
+
+                    rec["n_annotations"] += 1
+
+                    if user:
+                        rec["annotators"].add(user)
+
+                    # span?
+                    if exact and str(exact).strip():
+                        rec["has_span"] = True
+                        # keep up to 3 unique examples
+                        ex = str(exact).strip()
+                        if ex and ex not in rec["span_examples"] and len(rec["span_examples"]) < 3:
+                            rec["span_examples"].append(ex)
+
+                    # values aggregation
+                    if val:
+                        rec["values_set"].add(val)
+                        # pick latest non-empty by updated timestamp
+                        if upd:
+                            if rec["latest_updated"] is None or upd > rec["latest_updated"]:
+                                rec["latest_updated"] = upd
+                                rec["latest_value"] = val
+                        else:
+                            # if no updated, keep first non-empty as fallback
+                            if rec["latest_value"] is None:
+                                rec["latest_value"] = val
+
+            # Emit rows (sorted for stability)
+            for (doc_id, canonical_code) in sorted(agg.keys()):
+                rec = agg[(doc_id, canonical_code)]
+                values_list = sorted(list(rec["values_set"]))
+                values_json = json.dumps(values_list, ensure_ascii=False)
+
+                row = {
+                    "project_id": str(project_id),
+                    "document_id": doc_id,
+                    "canonical_url": doc_url.get(doc_id) or "",
+                    "code": canonical_code,
+                    "code_version": rec["code_version"],
+                    "source": "human",
+                    "value": rec["latest_value"] or "",
+                    "value_mode": "latest_nonempty_text",
+                    "values": values_json,
+                    "n_values": len(values_list),
+                    "has_span": bool(rec["has_span"]),
+                    "span_examples": " || ".join(rec["span_examples"]) if rec["span_examples"] else "",
+                    "n_annotations": rec["n_annotations"],
+                    "latest_updated": iso_z(rec["latest_updated"]),
+                }
+                if include_annotators:
+                    row["annotators"] = ";".join(sorted(rec["annotators"])) if rec["annotators"] else ""
+
+                w.writerow(row)
+                yield buf.getvalue()
+                buf.seek(0)
+                buf.truncate(0)
+
+        filename = f"export_project_{project_id}.csv"
+        return StreamingResponse(
+            gen(),
+            media_type="text/csv",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+
     finally:
         db.close()
