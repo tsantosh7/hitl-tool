@@ -17,6 +17,7 @@ from sqlalchemy.orm import relationship
 
 from .db import Base
 
+from sqlalchemy import UniqueConstraint
 
 class Team(Base):
     __tablename__ = "teams"
@@ -108,3 +109,45 @@ class HypothesisAnnotation(Base):
     group = relationship("HypothesisGroup")
     document = relationship("Document", back_populates="hypothesis_annotations")
 
+class Code(Base):
+    """
+    Canonical code registry.
+    - version: "v1" (original 43, locked) or "ext" (schema evolution)
+    """
+    __tablename__ = "codes"
+
+    code = Column(String, primary_key=True)          # canonical tag string, e.g. "Appellant"
+    version = Column(String, nullable=False)         # "v1" | "ext"
+    display_name = Column(String, nullable=True)
+    description = Column(Text, nullable=True)
+
+    is_active = Column(Boolean, nullable=False, default=True)
+    is_locked = Column(Boolean, nullable=False, default=False)  # True for v1
+
+    created_by = Column(String, nullable=True)       # optional user id/email
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    updated_at = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    aliases = relationship(
+        "CodeAlias",
+        back_populates="code_ref",
+        cascade="all, delete-orphan",
+    )
+
+
+class CodeAlias(Base):
+    """
+    Alias -> canonical mapping (supports renames, typos, old tags).
+    """
+    __tablename__ = "code_aliases"
+
+    alias = Column(String, primary_key=True)          # e.g. "Confess Plead"
+    code = Column(String, ForeignKey("codes.code"), nullable=False)  # canonical
+
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+
+    code_ref = relationship("Code", back_populates="aliases")
+
+    __table_args__ = (
+        UniqueConstraint("alias", name="uq_code_alias"),
+    )

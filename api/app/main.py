@@ -16,13 +16,21 @@ from sqlalchemy import select
 import queue
 import threading
 
+from datetime import timezone
+from dateutil import parser as dtparser
+from collections import defaultdict
+from typing import Optional
 
 from .db import SessionLocal
 from .init_db import init
 from .models import (
     Team, Project, Document, ProjectDocument,
-    HypothesisGroup, HypothesisAnnotation
+    HypothesisGroup, HypothesisAnnotation,
+    Code, CodeAlias,
 )
+
+import re
+from typing import Optional, Tuple
 
 SOLR_BASE_URL = os.getenv("SOLR_BASE_URL", "").strip()
 HYPOTHESIS_API_TOKEN = os.getenv("HYPOTHESIS_API_TOKEN", "").strip()
@@ -46,6 +54,13 @@ app = FastAPI()
 def on_startup():
     init()
     os.makedirs(HYPOTHESIS_SNAPSHOT_DIR, exist_ok=True)
+    db = SessionLocal()
+    try:
+        seed_v1_codes(db)
+        seed_code_aliases(db)
+    finally:
+        db.close()
+
 
 
 @app.get("/health")
@@ -63,6 +78,26 @@ def health():
 # ------------------------------------------------------------------------------
 # Utilities
 # ------------------------------------------------------------------------------
+def parse_dt_utc(val):
+    """
+    Normalize Hypothesis timestamps to timezone-aware UTC datetimes.
+    Accepts ISO8601 strings (with Z or +00:00) or datetime objects.
+    Returns None if val is falsy.
+    """
+    if not val:
+        return None
+
+    if isinstance(val, datetime):
+        dt = val
+    else:
+        s = str(val).strip()
+        # Hypothesis sometimes uses Z; fromisoformat wants +00:00
+        s = s.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(s)
+
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
 
 def _require_solr() -> None:
     if not SOLR_BASE_URL:
@@ -120,7 +155,12 @@ def chunked(xs: List[Any], n: int) -> Iterable[List[Any]]:
 
 V1_CODES_PATH = os.getenv("V1_CODES_PATH", "/app/data/schema_v1_codes.json")
 
+
 def load_v1_codes() -> set[str]:
+    """
+    Loads the canonical v1 list (original 43) from JSON.
+    Expected format: {"v1_codes": ["CodeA", "CodeB", ...]}
+    """
     try:
         with open(V1_CODES_PATH, "r", encoding="utf-8") as f:
             obj = json.load(f)
@@ -129,26 +169,228 @@ def load_v1_codes() -> set[str]:
     except Exception:
         return set()
 
+
 V1_CODES: set[str] = load_v1_codes()
 
-def normalize_code(tag: str) -> str:
-    # Conservative: do not change semantics, only strip whitespace.
-    return (tag or "").strip()
 
-def split_codes(tags: list[str]) -> tuple[set[str], set[str], set[str]]:
+
+def seed_v1_codes(db):
+    """
+    Ensures all v1 codes exist in the DB and are locked.
+    Safe to run on every startup.
+    """
+    if not V1_CODES:
+        return
+
+    existing = set(
+        db.execute(select(Code.code).where(Code.version == "v1")).scalars().all()
+    )
+    missing = [c for c in V1_CODES if c not in existing]
+
+    for c in missing:
+        db.add(
+            Code(
+                code=c,
+                version="v1",
+                is_active=True,
+                is_locked=True,
+            )
+        )
+
+    if missing:
+        db.commit()
+
+
+
+
+def normalize_tag(t: str) -> str:
+    """Light trim only (we keep raw tag for audit; normalization happens in key funcs)."""
+    return (t or "").strip()
+
+
+def canon_key(s: str) -> str:
+    """
+    A stable comparison key:
+    - lowercased
+    - remove all non-alphanumerics
+    This makes tags like "Confess/Plead" and "confess plead" comparable.
+    """
+    s = (s or "").strip().lower()
+    s = re.sub(r"[^a-z0-9]+", "", s)
+    return s
+
+
+def levenshtein(a: str, b: str, max_dist: int = 2) -> int:
+    """
+    Bounded Levenshtein distance.
+    Returns > max_dist if distance exceeds threshold (fast exit).
+    """
+    if a == b:
+        return 0
+    if abs(len(a) - len(b)) > max_dist:
+        return max_dist + 1
+    if not a:
+        return len(b)
+    if not b:
+        return len(a)
+
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, start=1):
+        cur = [i]
+        row_min = cur[0]
+        for j, cb in enumerate(b, start=1):
+            ins = cur[j - 1] + 1
+            dele = prev[j] + 1
+            sub = prev[j - 1] + (0 if ca == cb else 1)
+            v = min(ins, dele, sub)
+            cur.append(v)
+            if v < row_min:
+                row_min = v
+        prev = cur
+        if row_min > max_dist:
+            return max_dist + 1
+    return prev[-1]
+
+
+def load_code_maps(db) -> tuple[dict[str, str], dict[str, str], dict[str, str]]:
+    """
+    Returns:
+      - canon_version: canonical_code -> "v1"|"ext" (only active codes)
+      - alias_to_canon: alias -> canonical_code
+      - key_to_canon: canon_key(canonical_code) -> canonical_code (active only)
+    """
+    code_rows = db.execute(select(Code.code, Code.version, Code.is_active)).all()
+    canon_version: dict[str, str] = {}
+    key_to_canon: dict[str, str] = {}
+
+    for code, version, active in code_rows:
+        if not active:
+            continue
+        canon_version[code] = version
+        key_to_canon[canon_key(code)] = code
+
+    alias_rows = db.execute(select(CodeAlias.alias, CodeAlias.code)).all()
+    alias_to_canon = {normalize_tag(a): c for (a, c) in alias_rows}
+
+    return canon_version, alias_to_canon, key_to_canon
+
+
+def resolve_tag_to_canonical(
+    tag: str,
+    canon_version: dict[str, str],
+    alias_to_canon: dict[str, str],
+    key_to_canon: dict[str, str],
+    *,
+    fuzzy_max_dist: int = 2,
+) -> Optional[str]:
+    """
+    Resolve a raw Hypothesis tag to a canonical registry code.
+    Policy: if we can't confidently resolve, return None (treated as unregistered).
+    """
+    raw = normalize_tag(tag)
+    if not raw:
+        return None
+
+    # 1) Exact canonical match
+    if raw in canon_version:
+        return raw
+
+    # 2) Exact alias match
+    if raw in alias_to_canon:
+        return alias_to_canon[raw]
+
+    # 3) Normalized key match (punctuation/case differences)
+    k = canon_key(raw)
+    if k in key_to_canon:
+        return key_to_canon[k]
+
+    # 4) Tiny fuzzy match against canonical keys (typos like Appellent)
+    # Only accept if best is unique and within threshold
+    best_code = None
+    best_dist = fuzzy_max_dist + 1
+    second_best = fuzzy_max_dist + 1
+
+    for ck, canonical in key_to_canon.items():
+        d = levenshtein(k, ck, max_dist=fuzzy_max_dist)
+        if d < best_dist:
+            second_best = best_dist
+            best_dist = d
+            best_code = canonical
+        elif d < second_best:
+            second_best = d
+
+    if best_code is not None and best_dist <= fuzzy_max_dist and best_dist < second_best:
+        return best_code
+
+    return None
+
+
+def split_codes(db, tags: list[str]) -> tuple[set[str], set[str], set[str]]:
+    """
+    Registry-backed split:
+      - v1: canonical codes registered as version="v1"
+      - ext: canonical codes registered as version="ext"
+      - allc: union
+    Unregistered/unresolvable tags are ignored (governance-first).
+    """
+    canon_version, alias_to_canon, key_to_canon = load_code_maps(db)
+
     v1: set[str] = set()
     ext: set[str] = set()
     allc: set[str] = set()
-    for t in tags or []:
-        c = normalize_code(t)
-        if not c:
+
+    for t in (tags or []):
+        canonical = resolve_tag_to_canonical(
+            t, canon_version, alias_to_canon, key_to_canon
+        )
+        if not canonical:
             continue
-        allc.add(c)
-        if c in V1_CODES:
-            v1.add(c)
+
+        allc.add(canonical)
+        if canon_version.get(canonical) == "v1":
+            v1.add(canonical)
         else:
-            ext.add(c)
+            ext.add(canonical)
+
     return v1, ext, allc
+
+
+
+def seed_code_aliases(db):
+    """
+    One-time / idempotent seeding of known legacy Hypothesis tags -> canonical codes.
+    Safe to run multiple times.
+    """
+    mappings = {
+        # safe + clear
+        "Appellent": "Appellant",
+        "Confess/Plead": "ConfessPleadGuilty",
+        "WhatAncilliary": "WhatAncillary",
+        "Ancillary": "WhatAncillary",
+        "AquitOffence": "AcquitOffence",
+        "ReasonSentExcess": "ReasonSentExcessNotLenient",
+        "ReasonSentLenient": "ReasonSentLenientNotExcess",
+
+        # OPTIONAL (uncomment if you're sure these are intended)
+        # "ConvCourtType": "ConvCourtName",
+        # "SentCourtType": "SentCourtName",
+        # "RSE_is": "ReasonSentExcessNotLenient",
+    }
+
+    # only add aliases if target canonical exists
+    existing_codes = set(db.execute(select(Code.code)).scalars().all())
+
+    for alias, canonical in mappings.items():
+        if canonical not in existing_codes:
+            continue
+        alias = normalize_tag(alias)
+        if not alias:
+            continue
+        if db.get(CodeAlias, alias):
+            continue
+        db.add(CodeAlias(alias=alias, code=canonical))
+
+    db.commit()
 
 # ------------------------------------------------------------------------------
 # Solr helpers
@@ -186,6 +428,30 @@ def solr_atomic_update(core: str, atomic_docs: List[dict], commit_within_ms: int
     if r.status_code >= 300:
         raise HTTPException(status_code=500, detail=f"Solr atomic update failed: {r.status_code} {r.text[:800]}")
 
+
+def solr_update_codes_only(core: str, doc_codes: Dict[str, Dict[str, set[str]]]) -> int:
+    """
+    Atomic updates for codes_* only.
+    Uses 'set' to be deterministic and de-duplicate.
+    """
+    if not doc_codes:
+        return 0
+
+    atomic_docs = []
+    for document_id, codes in doc_codes.items():
+        atomic_docs.append({
+            "document_id_s": document_id,
+            "codes_v1_ss": {"set": sorted(codes["v1"])},
+            "codes_ext_ss": {"set": sorted(codes["ext"])},
+            "codes_all_ss": {"set": sorted(codes["all"])},
+        })
+
+    updated = 0
+    for batch in chunked(atomic_docs, 500):
+        solr_atomic_update(core, batch, commit_within_ms=5000)
+        updated += len(batch)
+
+    return updated
 
 # ------------------------------------------------------------------------------
 # Corpus ingestion Solr doc builder (patched)
@@ -664,18 +930,109 @@ def bulk_resolve_document_ids(db, urls: List[str]) -> Dict[str, str]:
     return url_to_doc
 
 
+def upsert_annotations_bulk(
+    db,
+    fields_list: List[dict],
+    url_to_doc: Dict[str, str],
+) -> Tuple[int, int, Dict[str, Dict[str, bool]], Dict[str, Dict[str, set[str]]]]:
+    """
+    Upsert annotations. Returns:
+      (annotations_seen, annotations_linked_to_docs, doc_flags_for_solr, doc_codes_for_solr)
+    """
+    seen = 0
+    linked = 0
+    doc_flags: Dict[str, Dict[str, bool]] = {}
+
+    # document_id -> {"v1": set(), "ext": set(), "all": set()}
+    doc_codes: Dict[str, Dict[str, set[str]]] = {}
+
+    for fields in fields_list:
+        seen += 1
+        ann_id = fields["annotation_id"]
+
+        canon = normalize_url(fields.get("canonical_url")) if fields.get("canonical_url") else None
+        doc_id = url_to_doc.get(canon) if canon else None
+
+        # Normalize timestamps *before* comparing/storing
+        new_updated = parse_dt_utc(fields.get("updated"))
+        new_created = parse_dt_utc(fields.get("created"))
+
+        row = db.get(HypothesisAnnotation, ann_id)
+        if row:
+            row_updated = parse_dt_utc(row.updated)
+
+            # If existing row is newer/equal, skip overwrite
+            if row_updated and new_updated and new_updated <= row_updated:
+                pass
+            else:
+                row.group_id = fields["group_id"]
+                row.document_id = doc_id
+                row.canonical_url = canon
+                row.user = fields.get("user")
+                row.created = new_created
+                row.updated = new_updated
+                row.text = fields.get("text")
+                row.tags = fields.get("tags") or []
+                row.exact = fields.get("exact")
+                row.prefix = fields.get("prefix")
+                row.suffix = fields.get("suffix")
+                row.raw = fields.get("raw") or {}
+        else:
+            row = HypothesisAnnotation(
+                annotation_id=ann_id,
+                group_id=fields["group_id"],
+                document_id=doc_id,
+                canonical_url=canon,
+                user=fields.get("user"),
+                created=new_created,
+                updated=new_updated,
+                text=fields.get("text"),
+                tags=fields.get("tags") or [],
+                exact=fields.get("exact"),
+                prefix=fields.get("prefix"),
+                suffix=fields.get("suffix"),
+                raw=fields.get("raw") or {},
+            )
+            db.add(row)
+
+        if doc_id:
+            linked += 1
+
+            # Flags
+            if doc_id not in doc_flags:
+                doc_flags[doc_id] = {"has_human": True, "has_any_span": False}
+            if fields.get("exact") and str(fields.get("exact")).strip():
+                doc_flags[doc_id]["has_any_span"] = True
+
+            # Codes (registry-backed)
+            tags = fields.get("tags") or []
+            v1, ext, allc = split_codes(db, tags)
+
+            bucket = doc_codes.setdefault(doc_id, {"v1": set(), "ext": set(), "all": set()})
+            bucket["v1"].update(v1)
+            bucket["ext"].update(ext)
+            bucket["all"].update(allc)
+
+    return seen, linked, doc_flags, doc_codes
+
+
+
+
 # def upsert_annotations_bulk(
 #     db,
 #     fields_list: List[dict],
 #     url_to_doc: Dict[str, str],
-# ) -> Tuple[int, int, Dict[str, Dict[str, bool]]]:
+# ) -> Tuple[int, int, Dict[str, Dict[str, bool]], Dict[str, Dict[str, set[str]]]]:
 #     """
 #     Upsert annotations. Returns:
-#       (annotations_seen, annotations_linked_to_docs, doc_flags_for_solr)
+#       (annotations_seen, annotations_linked_to_docs, doc_flags_for_solr, doc_codes_for_solr)
 #     """
 #     seen = 0
 #     linked = 0
 #     doc_flags: Dict[str, Dict[str, bool]] = {}
+#
+#     # document_id -> {"v1": set(), "ext": set(), "all": set()}
+#     doc_codes: Dict[str, Dict[str, set[str]]] = {}
 #
 #     for fields in fields_list:
 #         seen += 1
@@ -722,93 +1079,22 @@ def bulk_resolve_document_ids(db, urls: List[str]) -> Dict[str, str]:
 #
 #         if doc_id:
 #             linked += 1
+#
+#             # Flags
 #             if doc_id not in doc_flags:
 #                 doc_flags[doc_id] = {"has_human": True, "has_any_span": False}
 #             if fields.get("exact") and str(fields.get("exact")).strip():
 #                 doc_flags[doc_id]["has_any_span"] = True
 #
-#     return seen, linked, doc_flags
-
-from typing import DefaultDict
-from collections import defaultdict
-
-def upsert_annotations_bulk(
-    db,
-    fields_list: List[dict],
-    url_to_doc: Dict[str, str],
-) -> Tuple[int, int, Dict[str, Dict[str, bool]], Dict[str, Dict[str, set[str]]]]:
-    """
-    Upsert annotations. Returns:
-      (annotations_seen, annotations_linked_to_docs, doc_flags_for_solr, doc_codes_for_solr)
-    """
-    seen = 0
-    linked = 0
-    doc_flags: Dict[str, Dict[str, bool]] = {}
-
-    # document_id -> {"v1": set(), "ext": set(), "all": set()}
-    doc_codes: Dict[str, Dict[str, set[str]]] = {}
-
-    for fields in fields_list:
-        seen += 1
-        ann_id = fields["annotation_id"]
-
-        canon = normalize_url(fields.get("canonical_url")) if fields.get("canonical_url") else None
-        doc_id = url_to_doc.get(canon) if canon else None
-
-        row = db.get(HypothesisAnnotation, ann_id)
-        if row:
-            new_updated = fields.get("updated")
-            if row.updated and new_updated and new_updated <= row.updated:
-                pass
-            else:
-                row.group_id = fields["group_id"]
-                row.document_id = doc_id
-                row.canonical_url = canon
-                row.user = fields.get("user")
-                row.created = fields.get("created")
-                row.updated = fields.get("updated")
-                row.text = fields.get("text")
-                row.tags = fields.get("tags") or []
-                row.exact = fields.get("exact")
-                row.prefix = fields.get("prefix")
-                row.suffix = fields.get("suffix")
-                row.raw = fields.get("raw") or {}
-        else:
-            row = HypothesisAnnotation(
-                annotation_id=ann_id,
-                group_id=fields["group_id"],
-                document_id=doc_id,
-                canonical_url=canon,
-                user=fields.get("user"),
-                created=fields.get("created"),
-                updated=fields.get("updated"),
-                text=fields.get("text"),
-                tags=fields.get("tags") or [],
-                exact=fields.get("exact"),
-                prefix=fields.get("prefix"),
-                suffix=fields.get("suffix"),
-                raw=fields.get("raw") or {},
-            )
-            db.add(row)
-
-        if doc_id:
-            linked += 1
-
-            # Flags
-            if doc_id not in doc_flags:
-                doc_flags[doc_id] = {"has_human": True, "has_any_span": False}
-            if fields.get("exact") and str(fields.get("exact")).strip():
-                doc_flags[doc_id]["has_any_span"] = True
-
-            # Codes
-            tags = fields.get("tags") or []
-            v1, ext, allc = split_codes(tags)
-            bucket = doc_codes.setdefault(doc_id, {"v1": set(), "ext": set(), "all": set()})
-            bucket["v1"].update(v1)
-            bucket["ext"].update(ext)
-            bucket["all"].update(allc)
-
-    return seen, linked, doc_flags, doc_codes
+#             # Codes
+#             tags = fields.get("tags") or []
+#             v1, ext, allc = split_codes(tags)
+#             bucket = doc_codes.setdefault(doc_id, {"v1": set(), "ext": set(), "all": set()})
+#             bucket["v1"].update(v1)
+#             bucket["ext"].update(ext)
+#             bucket["all"].update(allc)
+#
+#     return seen, linked, doc_flags, doc_codes
 
 def solr_update_flags_for_docs(
     core: str,
@@ -1020,7 +1306,12 @@ def run_hypothesis_sync(payload: HypothesisSyncRequest, emit=None) -> dict:
                 "sample_codes_all_count": (len(next(iter(doc_codes.values()))["all"]) if doc_codes else 0),
             })
 
-            if g_row and not payload.force_full and max_updated_str:
+            # if g_row and not payload.force_full and max_updated_str:
+            #     g_row.last_synced_updated = max_updated_str
+            #     g_row.last_synced_at = datetime.utcnow()
+            #     db.commit()
+
+            if g_row and max_updated_str:
                 g_row.last_synced_updated = max_updated_str
                 g_row.last_synced_at = datetime.utcnow()
                 db.commit()
@@ -1100,3 +1391,177 @@ def hypothesis_sync_stream(payload: HypothesisSyncRequest):
                 yield ": ping\n\n"
 
     return StreamingResponse(gen(), media_type="text/event-stream")
+
+
+############## Progress sync without hypothesis download##################
+# Recompute codes for everything
+# curl -sS -X POST "http://localhost:8000/solr/recompute_codes?core=hitl_test"
+#
+# Recompute codes only for one group
+# curl -sS -X POST "http://localhost:8000/solr/recompute_codes?core=hitl_test&group_id=Qb9zgyQY"
+
+@app.post("/solr/recompute_codes")
+def recompute_solr_codes(core: str = "hitl_test", group_id: Optional[str] = None):
+    """
+    Recompute codes_* fields in Solr purely from Postgres hypothesis_annotations.
+    No Hypothesis API calls. Useful after schema evolution / code mapping changes.
+    Optional group_id restricts to a single Hypothesis group.
+    """
+    db = SessionLocal()
+    try:
+        # document_id -> {"v1": set(), "ext": set(), "all": set()}
+        doc_codes: Dict[str, Dict[str, set[str]]] = {}
+
+        # Stream rows (avoid loading all annotations)
+        stmt = select(
+            HypothesisAnnotation.document_id,
+            HypothesisAnnotation.tags,
+        ).where(HypothesisAnnotation.document_id.is_not(None))
+
+        if group_id:
+            stmt = stmt.where(HypothesisAnnotation.group_id == group_id)
+
+        # If your dataset is big, yield_per keeps memory stable
+        rows = db.execute(stmt).yield_per(5000)
+
+        ann_rows = 0
+        docs_touched = 0
+
+        for document_id, tags in rows:
+            ann_rows += 1
+            if not document_id:
+                continue
+
+            v1, ext, allc = split_codes(db, tags or [])
+            if not (v1 or ext or allc):
+                continue
+
+            bucket = doc_codes.get(document_id)
+            if not bucket:
+                bucket = {"v1": set(), "ext": set(), "all": set()}
+                doc_codes[document_id] = bucket
+                docs_touched += 1
+
+            bucket["v1"].update(v1)
+            bucket["ext"].update(ext)
+            bucket["all"].update(allc)
+
+        # Push to Solr
+        updated = solr_update_codes_only(core, doc_codes)
+
+        return {
+            "ok": True,
+            "core": core,
+            "group_id": group_id,
+            "annotation_rows_scanned": ann_rows,
+            "docs_with_codes": len(doc_codes),
+            "docs_updated_in_solr": updated,
+        }
+    finally:
+        db.close()
+
+
+##Add the minimal code-registry API (optional but recommended)
+
+# If you want users/admins to actually “Add Codes” without touching DB manually.
+
+##
+class CodeCreate(BaseModel):
+    code: str
+    display_name: Optional[str] = None
+    description: Optional[str] = None
+
+
+class AliasCreate(BaseModel):
+    alias: str
+
+
+@app.get("/codes")
+def list_codes(include_inactive: bool = False):
+    db = SessionLocal()
+    try:
+        q = select(Code)
+        if not include_inactive:
+            q = q.where(Code.is_active == True)
+
+        codes = db.execute(q).scalars().all()
+        out = []
+        for c in codes:
+            aliases = db.execute(select(CodeAlias.alias).where(CodeAlias.code == c.code)).scalars().all()
+            out.append({
+                "code": c.code,
+                "version": c.version,
+                "display_name": c.display_name,
+                "description": c.description,
+                "is_active": c.is_active,
+                "is_locked": c.is_locked,
+                "aliases": aliases,
+            })
+        return {"codes": out}
+    finally:
+        db.close()
+
+
+@app.post("/codes")
+def create_code(payload: CodeCreate):
+    db = SessionLocal()
+    try:
+        code = normalize_tag(payload.code)
+        if not code:
+            raise HTTPException(400, "code is empty")
+
+        if db.get(Code, code):
+            raise HTTPException(409, "code already exists")
+
+        row = Code(
+            code=code,
+            version="ext",
+            display_name=payload.display_name,
+            description=payload.description,
+            is_active=True,
+            is_locked=False,
+        )
+        db.add(row)
+        db.commit()
+        return {"ok": True, "code": code, "version": "ext"}
+    finally:
+        db.close()
+
+
+@app.post("/codes/{code}/aliases")
+def add_alias(code: str, payload: AliasCreate):
+    db = SessionLocal()
+    try:
+        code = normalize_tag(code)
+        alias = normalize_tag(payload.alias)
+
+        c = db.get(Code, code)
+        if not c or not c.is_active:
+            raise HTTPException(404, "unknown code")
+
+        if db.get(CodeAlias, alias):
+            raise HTTPException(409, "alias already exists")
+
+        db.add(CodeAlias(alias=alias, code=code))
+        db.commit()
+        return {"ok": True, "code": code, "alias": alias}
+    finally:
+        db.close()
+
+
+@app.patch("/codes/{code}/deactivate")
+def deactivate_code(code: str):
+    db = SessionLocal()
+    try:
+        code = normalize_tag(code)
+        row = db.get(Code, code)
+        if not row:
+            raise HTTPException(404, "unknown code")
+        if row.is_locked:
+            raise HTTPException(400, "cannot deactivate locked v1 code")
+
+        row.is_active = False
+        db.commit()
+        return {"ok": True, "code": code}
+    finally:
+        db.close()
