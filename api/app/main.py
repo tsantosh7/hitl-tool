@@ -2,12 +2,14 @@
 import os
 import json
 import random
+import re
 import requests
 import urllib.parse
 from datetime import datetime, date
 from typing import Any, Dict, List, Optional, Iterable, Tuple
 from uuid import uuid4
 
+from pydantic import BaseModel, Field
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, HttpUrl
@@ -17,14 +19,22 @@ import queue
 import threading
 
 from datetime import timezone
-from dateutil import parser as dtparser
-from collections import defaultdict
-from typing import Optional
+import uuid
+
+from sqlalchemy import func
+
+
 from uuid import UUID
 import csv
 import io
 from fastapi.responses import StreamingResponse
 from sqlalchemy import func
+
+
+import urllib.parse
+
+from pydantic import BaseModel, Field
+
 
 
 from .db import SessionLocal
@@ -35,7 +45,7 @@ from .models import (
     Code, CodeAlias,
 )
 
-import re
+
 from typing import Optional, Tuple
 
 SOLR_BASE_URL = os.getenv("SOLR_BASE_URL", "").strip()
@@ -473,6 +483,81 @@ def iter_project_document_ids(
     return sorted(list(proj_set))
 
 
+def csv_safe_col(s: str) -> str:
+    """
+    Convert a canonical code into a stable CSV column name.
+    e.g. "ConfessPleadGuilty" -> "code__ConfessPleadGuilty"
+         "Confess/Plead" (shouldn't happen after canonical) -> "code__Confess_Plead"
+    """
+    base = re.sub(r"[^A-Za-z0-9_]+", "_", s).strip("_")
+    return f"code__{base}"
+
+
+def build_wide_aggregates(
+    db,
+    doc_ids: list[str],
+    canon_version: dict[str, str],
+    alias_to_canon: dict[str, str],
+    key_to_canon: dict[str, str],
+    *,
+    version: str = "all",     # v1|ext|all
+    code_filter: str | None = None,
+) -> tuple[dict[str, dict[str, dict]], set[str]]:
+    """
+    Returns:
+      - per_doc: doc_id -> canonical_code -> metrics dict
+      - codes_seen: set of canonical_code
+    Metrics dict contains:
+      { "count": int, "latest_value": str|None, "latest_updated": datetime|None }
+    """
+    per_doc: dict[str, dict[str, dict]] = {}
+    codes_seen: set[str] = set()
+
+    stmt = select(
+        HypothesisAnnotation.document_id,
+        HypothesisAnnotation.tags,
+        HypothesisAnnotation.text,
+        HypothesisAnnotation.updated,
+    ).where(HypothesisAnnotation.document_id.in_(doc_ids))
+
+    for doc_id, tags, text, updated in db.execute(stmt).yield_per(5000):
+        if not doc_id:
+            continue
+
+        resolved = resolve_codes_for_tags_cached(tags or [], canon_version, alias_to_canon, key_to_canon)
+        if not resolved:
+            continue
+
+        val = (text or "").strip()
+        upd = parse_dt_utc(updated)
+
+        for canonical_code, code_ver in resolved:
+            if code_filter and canonical_code != code_filter:
+                continue
+            if version != "all" and code_ver != version:
+                continue
+
+            codes_seen.add(canonical_code)
+
+            doc_bucket = per_doc.setdefault(doc_id, {})
+            rec = doc_bucket.get(canonical_code)
+            if not rec:
+                rec = {"count": 0, "latest_value": None, "latest_updated": None}
+                doc_bucket[canonical_code] = rec
+
+            rec["count"] += 1
+
+            if val:
+                if upd:
+                    if rec["latest_updated"] is None or upd > rec["latest_updated"]:
+                        rec["latest_updated"] = upd
+                        rec["latest_value"] = val
+                else:
+                    if rec["latest_value"] is None:
+                        rec["latest_value"] = val
+
+    return per_doc, codes_seen
+
 # ------------------------------------------------------------------------------
 # Solr helpers
 # ------------------------------------------------------------------------------
@@ -533,6 +618,77 @@ def solr_update_codes_only(core: str, doc_codes: Dict[str, Dict[str, set[str]]])
         updated += len(batch)
 
     return updated
+
+
+def solr_add_project_membership(core: str, project_id: str, document_ids: list[str]) -> int:
+    if not document_ids:
+        return 0
+    atomic_docs = []
+    for did in document_ids:
+        atomic_docs.append({
+            "document_id_s": did,
+            "project_ids_ss": {"add": project_id},
+        })
+    updated = 0
+    for batch in chunked(atomic_docs, 500):
+        solr_atomic_update(core, batch, commit_within_ms=5000)
+        updated += len(batch)
+    return updated
+
+
+def solr_set_project_membership(core: str, doc_to_projects: dict[str, set[str]]) -> int:
+    if not doc_to_projects:
+        return 0
+
+    atomic_docs = []
+    for document_id, pids in doc_to_projects.items():
+        atomic_docs.append({
+            "document_id_s": document_id,
+            "project_ids_ss": {"set": sorted(pids)},
+        })
+
+    updated = 0
+    for batch in chunked(atomic_docs, 500):
+        solr_atomic_update(core, batch, commit_within_ms=5000)
+        updated += len(batch)
+    return updated
+
+
+def solr_select(core: str, params: dict) -> dict:
+    """
+    SOLR_BASE_URL may be:
+      - http://solr:8983/solr        (common in docker)
+      - http://solr:8983            (less common)
+    This function handles both safely.
+    """
+    _require_solr()
+    base = SOLR_BASE_URL.rstrip("/")
+
+    # If base already ends with /solr, don't add another /solr
+    if base.endswith("/solr"):
+        url = f"{base}/{core}/select"
+    else:
+        url = f"{base}/solr/{core}/select"
+
+    r = requests.get(url, params=params, timeout=60)
+    r.raise_for_status()
+    return r.json()
+
+
+
+def solr_escape_term(s: str) -> str:
+    # good enough for UUIDs + simple values
+    return re.sub(r'([+\-!(){}[\]^"~*?:\\/]|&&|\|\|)', r'\\\1', s)
+
+
+def normalize_fq_list(fq):
+    if fq is None:
+        return []
+    if isinstance(fq, str):
+        return [fq]
+    return [x for x in fq if x]
+
+
 
 # ------------------------------------------------------------------------------
 # Corpus ingestion Solr doc builder (patched)
@@ -670,6 +826,17 @@ class CreateProjectOut(BaseModel):
     team_id: str
     project_id: str
     solr_core: str
+
+
+class TeamCreateRequest(BaseModel):
+    name: str = Field(..., min_length=1)
+
+class ProjectCreateRequest(BaseModel):
+    team_id: UUID
+    name: str = Field(..., min_length=1)
+
+class ProjectAddDocsRequest(BaseModel):
+    document_ids: list[str] = Field(..., min_length=1)
 
 
 # ------------------------------------------------------------------------------
@@ -1482,18 +1649,27 @@ def hypothesis_sync_stream(payload: HypothesisSyncRequest):
 # curl -sS -X POST "http://localhost:8000/solr/recompute_codes?core=hitl_test&group_id=Qb9zgyQY"
 
 @app.post("/solr/recompute_codes")
-def recompute_solr_codes(core: str = "hitl_test", group_id: Optional[str] = None):
+def recompute_solr_codes(core: str = "hitl_test", project_id: Optional[UUID] = None, group_id: Optional[str] = None):
     """
-    Recompute codes_* fields in Solr purely from Postgres hypothesis_annotations.
-    No Hypothesis API calls. Useful after schema evolution / code mapping changes.
-    Optional group_id restricts to a single Hypothesis group.
+    Recompute Solr codes_* purely from Postgres hypothesis_annotations.
+    No Hypothesis API calls.
+
+    Optional filters:
+      - project_id: only docs in that project
+      - group_id: only annotations from that Hypothesis group
     """
     db = SessionLocal()
     try:
-        # document_id -> {"v1": set(), "ext": set(), "all": set()}
-        doc_codes: Dict[str, Dict[str, set[str]]] = {}
+        # load code maps once
+        canon_version, alias_to_canon, key_to_canon = load_code_maps(db)
 
-        # Stream rows (avoid loading all annotations)
+        # determine doc scope (optional project filter)
+        doc_scope: Optional[set[str]] = None
+        if project_id:
+            doc_scope = set(
+                db.execute(select(ProjectDocument.document_id).where(ProjectDocument.project_id == project_id)).scalars().all()
+            )
+
         stmt = select(
             HypothesisAnnotation.document_id,
             HypothesisAnnotation.tags,
@@ -1502,40 +1678,82 @@ def recompute_solr_codes(core: str = "hitl_test", group_id: Optional[str] = None
         if group_id:
             stmt = stmt.where(HypothesisAnnotation.group_id == group_id)
 
-        # If your dataset is big, yield_per keeps memory stable
-        rows = db.execute(stmt).yield_per(5000)
+        doc_codes: dict[str, dict[str, set[str]]] = {}
 
-        ann_rows = 0
-        docs_touched = 0
-
-        for document_id, tags in rows:
-            ann_rows += 1
-            if not document_id:
+        scanned = 0
+        for doc_id, tags in db.execute(stmt).yield_per(5000):
+            scanned += 1
+            if not doc_id:
+                continue
+            if doc_scope is not None and doc_id not in doc_scope:
                 continue
 
-            v1, ext, allc = split_codes(db, tags or [])
-            if not (v1 or ext or allc):
+            v1, ext, allc = set(), set(), set()
+            # resolve tags -> canonical codes (registry + aliases + fuzzy)
+            for raw in (tags or []):
+                canonical = resolve_tag_to_canonical(raw, canon_version, alias_to_canon, key_to_canon)
+                if not canonical:
+                    continue
+                ver = canon_version.get(canonical)
+                if not ver:
+                    continue
+                allc.add(canonical)
+                if ver == "v1":
+                    v1.add(canonical)
+                else:
+                    ext.add(canonical)
+
+            if not allc:
                 continue
 
-            bucket = doc_codes.get(document_id)
-            if not bucket:
-                bucket = {"v1": set(), "ext": set(), "all": set()}
-                doc_codes[document_id] = bucket
-                docs_touched += 1
-
+            bucket = doc_codes.setdefault(doc_id, {"v1": set(), "ext": set(), "all": set()})
             bucket["v1"].update(v1)
             bucket["ext"].update(ext)
             bucket["all"].update(allc)
 
-        # Push to Solr
         updated = solr_update_codes_only(core, doc_codes)
 
         return {
             "ok": True,
             "core": core,
+            "project_id": str(project_id) if project_id else None,
             "group_id": group_id,
-            "annotation_rows_scanned": ann_rows,
+            "annotation_rows_scanned": scanned,
             "docs_with_codes": len(doc_codes),
+            "docs_updated_in_solr": updated,
+        }
+    finally:
+        db.close()
+
+@app.post("/solr/recompute_projects")
+def recompute_solr_projects(core: str = "hitl_test", project_id: Optional[UUID] = None):
+    """
+    Recompute Solr project_ids_ss purely from Postgres project_documents.
+    If project_id is provided: only that project is applied.
+    If not provided: rebuild for all project_documents.
+    """
+    db = SessionLocal()
+    try:
+        stmt = select(ProjectDocument.project_id, ProjectDocument.document_id)
+        if project_id:
+            stmt = stmt.where(ProjectDocument.project_id == project_id)
+
+        rows = db.execute(stmt).all()
+
+        doc_to_projects: dict[str, set[str]] = {}
+        for pid, did in rows:
+            if not did:
+                continue
+            bucket = doc_to_projects.setdefault(did, set())
+            bucket.add(str(pid))
+
+        updated = solr_set_project_membership(core, doc_to_projects)
+
+        return {
+            "ok": True,
+            "core": core,
+            "project_id": str(project_id) if project_id else None,
+            "project_document_rows_scanned": len(rows),
             "docs_updated_in_solr": updated,
         }
     finally:
@@ -1861,3 +2079,459 @@ def export_csv(
 
     finally:
         db.close()
+
+
+
+#
+#
+#
+# docker compose build api && docker compose up -d --force-recreate api
+# curl -L -o wide.csv "http://localhost:8000/export/csv_wide?project_id=5749b0e5-a0dd-4266-8a93-a4dd4114ee57"
+# head -n 3 wide.csv
+
+
+@app.get("/export/csv_wide")
+def export_csv_wide(
+    project_id: UUID,
+    document_id: Optional[str] = None,
+    document_ids: Optional[str] = None,  # comma-separated
+    code: Optional[str] = None,          # filter to one code (alias/variant ok)
+    version: str = "all",                # v1|ext|all
+    metric: str = "value",               # value|count|binary
+):
+    if version not in {"v1", "ext", "all"}:
+        raise HTTPException(400, "version must be v1|ext|all")
+    if metric not in {"value", "count", "binary"}:
+        raise HTTPException(400, "metric must be value|count|binary")
+
+    db = SessionLocal()
+    try:
+        # 1) doc set (project-scoped)
+        doc_ids = iter_project_document_ids(db, str(project_id), document_id=document_id, document_ids=document_ids)
+        if not doc_ids:
+            raise HTTPException(404, "No documents matched (check project membership and document_id(s))")
+
+        # 2) doc_id -> canonical_url
+        doc_rows = db.execute(
+            select(Document.document_id, Document.canonical_url).where(Document.document_id.in_(doc_ids))
+        ).all()
+        doc_url = {d: u for (d, u) in doc_rows}
+
+        # 3) load code maps once
+        canon_version, alias_to_canon, key_to_canon = load_code_maps(db)
+
+        # optional code filter normalized to canonical
+        code_filter: Optional[str] = None
+        if code:
+            cf = resolve_tag_to_canonical(code, canon_version, alias_to_canon, key_to_canon)
+            if not cf:
+                # return a header-only CSV with base columns
+                cf = "__NO_MATCH__"
+            code_filter = cf
+
+        # 4) aggregate across annotations for these docs
+        per_doc, codes_seen = build_wide_aggregates(
+            db,
+            doc_ids,
+            canon_version,
+            alias_to_canon,
+            key_to_canon,
+            version=version,
+            code_filter=code_filter if code_filter != "__NO_MATCH__" else "__NO_MATCH__",
+        )
+
+        # If user asked for an unknown code, produce empty wide body with only base headers
+        if code_filter == "__NO_MATCH__":
+            codes_seen = set()
+
+        # 5) build column list
+        code_cols = sorted([csv_safe_col(c) for c in codes_seen])
+        base_cols = ["project_id", "document_id", "canonical_url"]
+        headers = base_cols + code_cols
+
+        def gen():
+            buf = io.StringIO()
+            w = csv.DictWriter(buf, fieldnames=headers)
+            w.writeheader()
+            yield buf.getvalue()
+            buf.seek(0)
+            buf.truncate(0)
+
+            # For stable iteration:
+            codes_sorted = sorted(list(codes_seen))
+
+            for doc_id in sorted(doc_ids):
+                row = {
+                    "project_id": str(project_id),
+                    "document_id": doc_id,
+                    "canonical_url": doc_url.get(doc_id) or "",
+                }
+
+                doc_bucket = per_doc.get(doc_id, {})
+
+                for canonical_code in codes_sorted:
+                    col = csv_safe_col(canonical_code)
+                    rec = doc_bucket.get(canonical_code)
+
+                    if not rec:
+                        row[col] = "" if metric == "value" else (0 if metric in {"count", "binary"} else "")
+                        continue
+
+                    if metric == "value":
+                        row[col] = rec["latest_value"] or ""
+                    elif metric == "count":
+                        row[col] = rec["count"]
+                    else:  # binary
+                        row[col] = 1
+
+                w.writerow(row)
+                yield buf.getvalue()
+                buf.seek(0)
+                buf.truncate(0)
+
+        filename = f"export_wide_project_{str(project_id)}.csv"
+        return StreamingResponse(
+            gen(),
+            media_type="text/csv",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+    finally:
+        db.close()
+
+
+###############
+# Project and teams apis
+
+# POST /teams (bootstrap teams properly)
+# # POST /projects (create project)
+# # GET /projects (list projects)
+# # GET /projects/{project_id} (basic stats)
+# # POST /projects/{project_id}/documents/add (add list of document_ids)
+# # GET /projects/{project_id}/documents (paginate membership)
+#
+# And we will also update Solr membership project_ids_ss via atomic updates (so Solr filters work).
+
+#################################################################################
+
+@app.post("/teams")
+def create_team(payload: TeamCreateRequest):
+    db = SessionLocal()
+    try:
+        t = Team(team_id=uuid.uuid4(), name=payload.name.strip())
+        db.add(t)
+        db.commit()
+        return {"ok": True, "team_id": str(t.team_id), "name": t.name}
+    finally:
+        db.close()
+
+
+@app.post("/projects")
+def create_project(payload: ProjectCreateRequest):
+    db = SessionLocal()
+    try:
+        team = db.get(Team, payload.team_id)
+        if not team:
+            raise HTTPException(404, "team not found")
+
+        p = Project(project_id=uuid.uuid4(), team_id=payload.team_id, name=payload.name.strip())
+        db.add(p)
+        db.commit()
+        return {"ok": True, "project_id": str(p.project_id), "team_id": str(p.team_id), "name": p.name}
+    finally:
+        db.close()
+
+
+@app.get("/projects")
+def list_projects(team_id: UUID | None = None):
+    db = SessionLocal()
+    try:
+        q = select(Project)
+        if team_id:
+            q = q.where(Project.team_id == team_id)
+        projects = db.execute(q).scalars().all()
+        return {
+            "projects": [
+                {"project_id": str(p.project_id), "team_id": str(p.team_id), "name": p.name}
+                for p in projects
+            ]
+        }
+    finally:
+        db.close()
+
+
+@app.get("/projects/{project_id}")
+def get_project(project_id: UUID):
+    db = SessionLocal()
+    try:
+        p = db.get(Project, project_id)
+        if not p:
+            raise HTTPException(404, "project not found")
+
+        n_docs = db.execute(
+            select(func.count()).select_from(ProjectDocument).where(ProjectDocument.project_id == project_id)
+        ).scalar_one()
+
+        n_docs_with_ann = db.execute(
+            select(func.count(func.distinct(HypothesisAnnotation.document_id)))
+            .select_from(HypothesisAnnotation)
+            .join(ProjectDocument, ProjectDocument.document_id == HypothesisAnnotation.document_id)
+            .where(ProjectDocument.project_id == project_id)
+        ).scalar_one()
+
+        return {
+            "project_id": str(p.project_id),
+            "team_id": str(p.team_id),
+            "name": p.name,
+            "documents_total": int(n_docs),
+            "documents_with_human_annotations": int(n_docs_with_ann),
+        }
+    finally:
+        db.close()
+
+
+@app.post("/projects/{project_id}/documents/add")
+def add_documents_to_project(
+    project_id: UUID,
+    payload: ProjectAddDocsRequest,
+    core: str = "hitl_test",
+):
+    db = SessionLocal()
+    try:
+        p = db.get(Project, project_id)
+        if not p:
+            raise HTTPException(404, "project not found")
+
+        existing = set(
+            db.execute(select(Document.document_id).where(Document.document_id.in_(payload.document_ids))).scalars().all()
+        )
+        missing = [d for d in payload.document_ids if d not in existing]
+        if missing:
+            raise HTTPException(400, f"{len(missing)} document_ids not found")
+
+        added = 0
+        for did in payload.document_ids:
+            row = db.get(ProjectDocument, {"project_id": project_id, "document_id": did})
+            if row:
+                continue
+            db.add(ProjectDocument(project_id=project_id, document_id=did))
+            added += 1
+        db.commit()
+
+        solr_updated = solr_add_project_membership(core, str(project_id), payload.document_ids)
+        return {"ok": True, "project_id": str(project_id), "docs_added": added, "solr_docs_updated": solr_updated}
+    finally:
+        db.close()
+
+
+@app.get("/projects/{project_id}/documents")
+def list_project_documents(project_id: UUID, limit: int = 50, offset: int = 0):
+    db = SessionLocal()
+    try:
+        p = db.get(Project, project_id)
+        if not p:
+            raise HTTPException(404, "project not found")
+
+        rows = db.execute(
+            select(ProjectDocument.document_id)
+            .where(ProjectDocument.project_id == project_id)
+            .order_by(ProjectDocument.document_id)
+            .limit(limit)
+            .offset(offset)
+        ).scalars().all()
+
+        return {"project_id": str(project_id), "document_ids": rows, "limit": limit, "offset": offset}
+    finally:
+        db.close()
+
+
+
+
+############# SEARCH and SAMPLE ###########
+# GET /search endpoint (facets + filtering + project scope)
+# What it supports
+#
+# q free-text (default *:*)
+#
+# fq repeatable filters
+#
+# project_id → auto adds fq=project_ids_ss:<uuid>
+#
+# facets on:
+# doc_type_s, source_s, judges_ss, has_human_b, codes_all_ss, appeal_outcome_s
+#
+# pagination: start, rows
+#
+# returns: docs + facets + numFound
+
+@app.get("/search")
+def search(
+    core: str = "hitl_test",
+    q: str = "*:*",
+    fq: Optional[list[str]] = None,      # repeat ?fq=...&fq=...
+    project_id: Optional[UUID] = None,
+    rows: int = 20,
+    start: int = 0,
+    facet: bool = True,
+):
+    fq_list = normalize_fq_list(fq)
+
+    if project_id:
+        fq_list.append(f"project_ids_ss:{solr_escape_term(str(project_id))}")
+
+    facet_fields = [
+        "doc_type_s",
+        "source_s",
+        "judges_ss",
+        "has_human_b",
+        "codes_all_ss",
+        "appeal_outcome_s",
+    ]
+
+    params = {
+        "q": q or "*:*",
+        "rows": rows,
+        "start": start,
+        "wt": "json",
+        "fl": ",".join([
+            "document_id_s",
+            "canonical_url_s",
+            "title_txt",
+            "excerpt_txt",
+            "published_dt",
+            "doc_type_s",
+            "source_s",
+            "judges_ss",
+            "has_human_b",
+            "has_any_span_b",
+            "codes_v1_ss",
+            "codes_ext_ss",
+            "codes_all_ss",
+            "project_ids_ss",
+        ]),
+    }
+
+    if fq_list:
+        params["fq"] = fq_list
+
+    if facet:
+        params.update({
+            "facet": "true",
+            "facet.mincount": 1,
+            "facet.limit": 50,
+        })
+        # multiple facet.field supported by repeating param in requests
+        # easiest: add as list
+        params["facet.field"] = facet_fields
+
+    data = solr_select(core, params)
+
+    resp = data.get("response", {}) or {}
+    out = {
+        "ok": True,
+        "core": core,
+        "q": q,
+        "fq": fq_list,
+        "numFound": resp.get("numFound", 0),
+        "start": resp.get("start", 0),
+        "docs": resp.get("docs", []) or [],
+    }
+
+    if facet:
+        out["facets"] = data.get("facet_counts", {}) or {}
+
+    return out
+
+# 3) POST /sample endpoint (random sample via rand_f)
+# Why this is the right approach
+#
+# Because you have rand_f stored and indexed, we can sample by:
+#
+# generate a random float r in [0,1)
+#
+# query rand_f:[r TO 1] with base filters → get n docs
+#
+# if insufficient, wrap: rand_f:[0 TO r) to fill remaining
+#
+# This is fast, scalable, and doesn’t require expensive random sort.
+#
+# Payload model
+class SampleRequest(BaseModel):
+    core: str = "hitl_test"
+    q: str = "*:*"
+    fq: list[str] = Field(default_factory=list)
+    project_id: Optional[UUID] = None
+    n: int = 20
+
+# Endpoint
+@app.post("/sample")
+def sample_docs(payload: SampleRequest):
+    core = payload.core
+    q = payload.q or "*:*"
+    n = max(1, min(int(payload.n), 500))  # cap for safety
+
+    fq_list = list(payload.fq or [])
+    if payload.project_id:
+        fq_list.append(f"project_ids_ss:{solr_escape_term(str(payload.project_id))}")
+
+    # base fields returned
+    fl = ",".join([
+        "document_id_s",
+        "canonical_url_s",
+        "title_txt",
+        "excerpt_txt",
+        "published_dt",
+        "doc_type_s",
+        "source_s",
+        "judges_ss",
+        "has_human_b",
+        "has_any_span_b",
+        "codes_all_ss",
+        "project_ids_ss",
+        "rand_f",
+    ])
+
+    r = random.random()
+    fq_hi = fq_list + [f"rand_f:[{r} TO 1]"]
+    fq_lo = fq_list + [f"rand_f:[0 TO {r})"]
+
+    def fetch(fqs: list[str], need: int) -> list[dict]:
+        if need <= 0:
+            return []
+        params = {
+            "q": q,
+            "fq": fqs,
+            "rows": need,
+            "start": 0,
+            "wt": "json",
+            "fl": fl,
+        }
+        data = solr_select(core, params)
+        return (data.get("response", {}) or {}).get("docs", []) or []
+
+    docs = fetch(fq_hi, n)
+    if len(docs) < n:
+        more = fetch(fq_lo, n - len(docs))
+        docs.extend(more)
+
+    # de-dupe by document_id_s (just in case)
+    seen = set()
+    uniq = []
+    for d in docs:
+        did = d.get("document_id_s")
+        if not did or did in seen:
+            continue
+        seen.add(did)
+        uniq.append(d)
+        if len(uniq) >= n:
+            break
+
+    return {
+        "ok": True,
+        "core": core,
+        "q": q,
+        "fq": fq_list,
+        "n_requested": n,
+        "n_returned": len(uniq),
+        "rand_seed": r,
+        "docs": uniq,
+    }

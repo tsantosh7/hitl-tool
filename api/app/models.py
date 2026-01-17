@@ -16,8 +16,9 @@ from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship
 
 from .db import Base
-
 from sqlalchemy import UniqueConstraint
+from pydantic import BaseModel, Field
+
 
 class Team(Base):
     __tablename__ = "teams"
