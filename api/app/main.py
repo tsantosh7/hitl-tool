@@ -949,7 +949,6 @@ def solr_update_review_status(core: str, updates: list[dict]) -> int:
     return updated
 
 
-
 def solr_update_topics_for_docs(
     core: str,
     doc_to_topics: Dict[str, List[Dict[str, Any]]],
@@ -959,7 +958,7 @@ def solr_update_topics_for_docs(
 ) -> int:
     """
     doc_to_topics: doc_id -> list of {topic_key, topic_label, score}
-    Writes:
+    Writes or clears:
       - topics_ss
       - topic_keys_ss
       - topic_kv_ss (e.g. T01=0.82)
@@ -973,6 +972,25 @@ def solr_update_topics_for_docs(
     atomic_docs: List[dict] = []
 
     for doc_id, items in doc_to_topics.items():
+
+        # ----------------------------------------
+        # CASE 1: NO ACTIVE TOPICS → CLEAR IN SOLR
+        # ----------------------------------------
+        if not items:
+            atomic = {
+                "document_id_s": doc_id,
+                "has_topics_b": {"set": False},
+                "topic_run_id_s": {"set": None},
+                "topics_ss": {"set": []},
+                "topic_keys_ss": {"set": []},
+                "topic_kv_ss": {"set": []},
+            }
+            atomic_docs.append(atomic)
+            continue
+
+        # ----------------------------------------
+        # CASE 2: ACTIVE TOPICS → NORMAL SET
+        # ----------------------------------------
         labels: List[str] = []
         keys: List[str] = []
         kv: List[str] = []
@@ -1013,6 +1031,71 @@ def solr_update_topics_for_docs(
         updated += len(batch)
 
     return updated
+
+
+# def solr_update_topics_for_docs(
+#     core: str,
+#     doc_to_topics: Dict[str, List[Dict[str, Any]]],
+#     *,
+#     run_id: str,
+#     schema_version: Optional[str] = None,
+# ) -> int:
+#     """
+#     doc_to_topics: doc_id -> list of {topic_key, topic_label, score}
+#     Writes:
+#       - topics_ss
+#       - topic_keys_ss
+#       - topic_kv_ss (e.g. T01=0.82)
+#       - has_topics_b
+#       - topic_run_id_s
+#       - schema_versions_ss (optional add)
+#     """
+#     if not doc_to_topics:
+#         return 0
+#
+#     atomic_docs: List[dict] = []
+#
+#     for doc_id, items in doc_to_topics.items():
+#         labels: List[str] = []
+#         keys: List[str] = []
+#         kv: List[str] = []
+#
+#         for it in items:
+#             k = (it.get("topic_key") or "").strip()
+#             lab = (it.get("topic_label") or "").strip()
+#             sc = it.get("score")
+#
+#             if k:
+#                 keys.append(k)
+#             if lab:
+#                 labels.append(lab)
+#
+#             if k and sc is not None:
+#                 try:
+#                     kv.append(f"{k}={float(sc):.4f}")
+#                 except Exception:
+#                     kv.append(f"{k}={sc}")
+#
+#         atomic = {
+#             "document_id_s": doc_id,
+#             "has_topics_b": {"set": True},
+#             "topic_run_id_s": {"set": str(run_id)},
+#             "topics_ss": {"set": sorted(set(labels))},
+#             "topic_keys_ss": {"set": sorted(set(keys))},
+#             "topic_kv_ss": {"set": sorted(set(kv))},
+#         }
+#
+#         if schema_version:
+#             atomic["schema_versions_ss"] = {"add": schema_version}
+#
+#         atomic_docs.append(atomic)
+#
+#     updated = 0
+#     for batch in chunked(atomic_docs, 500):
+#         solr_atomic_update(core, batch, commit_within_ms=5000)
+#         updated += len(batch)
+#
+#     return updated
 
 
 
@@ -3412,34 +3495,24 @@ def ingest_topics(payload: TopicsIngestIn, core: str = "hitl_test"):
                 if not did or not key or not lab:
                     continue
 
-                row = db.get(
-                    DocumentTopic,
-                    {"run_id": payload.run_id, "document_id": did, "topic_key": key},
-                )
+                row = db.get(DocumentTopic, {"run_id": payload.run_id, "document_id": did, "topic_key": key})
 
-                # 1) Hard blocklist: never resurrect rejected/deleted (for any type)
+                # HARD BLOCK
                 if row and row.status in ("rejected", "deleted"):
                     continue
 
-                # 2) Never overwrite an active human label from external/model ingest
+                # HUMAN PROTECT
                 if row and row.assignment_type == "human" and row.status == "active":
                     continue
 
-                src = (t.source or "model").strip()
-                ev = t.evidence or {}
-
                 if row:
-                    # Safe to update only AUTO rows that are active
                     row.topic_label = lab
                     row.score = t.score
-                    row.source = src
-                    row.evidence = ev
-
-                    # Make ingest behavior explicit/predictable
+                    row.source = (t.source or "model").strip()
+                    row.evidence = t.evidence or {}
                     row.assignment_type = "auto"
                     row.status = "active"
                     row.reason = "bulk_ingest"
-                    row.updated_by = None  # or set to a service user if you have one
                 else:
                     db.add(DocumentTopic(
                         run_id=payload.run_id,
@@ -3447,15 +3520,11 @@ def ingest_topics(payload: TopicsIngestIn, core: str = "hitl_test"):
                         topic_key=key,
                         topic_label=lab,
                         score=t.score,
-                        source=src,
-                        evidence=ev,
-
-                        # Explicit, predictable defaults for ingest
+                        source=(t.source or "model").strip(),
+                        evidence=t.evidence or {},
                         assignment_type="auto",
                         status="active",
                         reason="bulk_ingest",
-                        created_by=None,  # or service user
-                        updated_by=None,
                     ))
 
                 upserted += 1
@@ -3464,21 +3533,29 @@ def ingest_topics(payload: TopicsIngestIn, core: str = "hitl_test"):
 
         solr_updated = 0
         if payload.update_solr:
-            # push only docs present in this ingest batch (fast)
+            batch_doc_ids = [it.document_id.strip() for it in payload.items if it.document_id]
+
+            rows = db.execute(
+                select(
+                    DocumentTopic.document_id,
+                    DocumentTopic.topic_key,
+                    DocumentTopic.topic_label,
+                    DocumentTopic.score,
+                )
+                .where(DocumentTopic.run_id == payload.run_id)
+                .where(DocumentTopic.document_id.in_(batch_doc_ids))
+                .where(DocumentTopic.status == "active")
+            ).all()
+
             doc_to_topics: Dict[str, List[Dict[str, Any]]] = {}
-            for item in payload.items:
-                did = item.document_id.strip()
-                items = []
-                for t in item.topics:
-                    if not t.topic_key or not t.topic_label:
-                        continue
-                    items.append({
-                        "topic_key": t.topic_key,
-                        "topic_label": t.topic_label,
-                        "score": t.score,
-                    })
-                if items:
-                    doc_to_topics[did] = items
+            for did, key, lab, score in rows:
+                doc_to_topics.setdefault(did, []).append(
+                    {"topic_key": key, "topic_label": lab, "score": score}
+                )
+
+            for did in batch_doc_ids:
+                doc_to_topics.setdefault(did, [])
+
 
             schema_v = run.topic_schema_version if payload.add_schema_version else None
             solr_updated = solr_update_topics_for_docs(
