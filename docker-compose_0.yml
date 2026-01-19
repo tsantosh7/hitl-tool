@@ -35,20 +35,20 @@ services:
 
   api:
     build: ./api
-    network_mode: "host"
     environment:
-      DATABASE_URL: postgresql+psycopg://corpus:corpuspass@localhost:5432/corpusdb
-      SOLR_BASE_URL: http://localhost:8983/solr
-      REDIS_URL: redis://localhost:6379/0
+      DATABASE_URL: postgresql+psycopg://corpus:corpuspass@postgres:5432/corpusdb
+      SOLR_BASE_URL: http://solr:8983/solr
+      REDIS_URL: redis://redis:6379/0
       FAISS_DIR: /data/faiss
       HYPOTHESIS_API_TOKEN: ${HYPOTHESIS_API_TOKEN}
       DATA_DIR: /app/data
-      EMBEDDING_MODEL: sentence-transformers/all-MiniLM-L6-v2
     volumes:
       - faissdata:/data/faiss
       - ./data:/app/data
-      - ./training:/app/training
+      - ./training:/app/training   # ✅ add this
       - ./scripts:/app/scripts
+    ports:
+      - "8000:8000"
     depends_on:
       postgres:
         condition: service_healthy

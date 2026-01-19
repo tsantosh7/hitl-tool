@@ -105,7 +105,7 @@ def extract_doc_text(row: Dict[str, Any]) -> str:
     if isinstance(user_text, str) and user_text.strip():
         return user_text
 
-    for k in ("text", "document", "content", "body", "body_txt"):
+    for k in ("content_text", "document", "content", "body", "body_txt"):
         if k in row and isinstance(row[k], str) and row[k].strip():
             return row[k]
 
@@ -385,7 +385,8 @@ def main():
                     },
                 }
                 out_f.write(json.dumps(out_row, ensure_ascii=False) + "\n")
-                raise RuntimeError("Schema mismatch detected. Stopping to avoid further spend.")
+                # raise RuntimeError("Schema mismatch detected. Stopping to avoid further spend.")
+                continue
 
             pred_obj = enforce_grounding(pred_obj, doc_text, SENTINEL)
             pred_obj = apply_field_sanity_rules(pred_obj)

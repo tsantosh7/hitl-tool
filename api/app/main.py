@@ -43,8 +43,19 @@ from .init_db import init
 from .models import (
     Team, Project, Document, ProjectDocument,
     HypothesisGroup, HypothesisAnnotation,
-    Code, CodeAlias, ProjectDocumentReview
+    Code, CodeAlias, ProjectDocumentReview, TopicRun, DocumentTopic
 )
+
+from uuid import UUID
+from sqlalchemy import select
+from .models import TopicRun, DocumentTopic
+from .models import DocEmbedding
+
+import requests
+from requests.adapters import HTTPAdapter
+from requests.exceptions import RequestException
+from urllib3.util.retry import Retry
+
 
 
 from typing import Optional, Tuple, List, Dict, Any
@@ -59,7 +70,12 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+import time, random
+import requests
+from requests import Response
+from requests.exceptions import ConnectionError, ReadTimeout, ChunkedEncodingError
 
+RETRYABLE_STATUS = {429, 500, 502, 503, 504}
 SOLR_BASE_URL = os.getenv("SOLR_BASE_URL", "").strip()
 HYPOTHESIS_API_TOKEN = os.getenv("HYPOTHESIS_API_TOKEN", "").strip()
 DATA_DIR = os.getenv("DATA_DIR", "").strip() or os.path.join(os.getcwd(), "data")
@@ -78,7 +94,12 @@ _SOLR_NEEDS_QUOTES = re.compile(r"""[\s:\[\]\(\)\{\}"'\\]""")  # whitespace, col
 HYPOTHESIS_PUBLIC_GROUP_ID = "__world__"
 HYPOTHESIS_EXCLUDE_PUBLIC = os.getenv("HYPOTHESIS_EXCLUDE_PUBLIC", "true").lower() == "true"
 
+
+
+
 app = FastAPI()
+
+
 
 
 @app.on_event("startup")
@@ -104,6 +125,58 @@ def health():
         "hypothesis_snapshot_dir": HYPOTHESIS_SNAPSHOT_DIR,
         "has_hypothesis_token": bool(HYPOTHESIS_API_TOKEN),
     }
+
+
+# -----------------------------
+# Topic Assignment API models
+# -----------------------------
+class TopicRunCreateIn(BaseModel):
+    project_id: Optional[UUID] = None
+    name: str
+    topic_schema_version: str = "topics-v1"
+    method: str = "external"
+    model: Optional[str] = None
+    params: Dict[str, Any] = Field(default_factory=dict)
+    created_by: Optional[str] = None
+
+
+class TopicRunOut(BaseModel):
+    run_id: str
+    project_id: Optional[str]
+    name: str
+    topic_schema_version: str
+    method: str
+    model: Optional[str]
+    params: Dict[str, Any]
+    is_active: bool
+    created_at: Optional[str]
+
+
+class TopicAssign(BaseModel):
+    topic_key: str
+    topic_label: str
+    score: Optional[float] = None
+    source: str = "model"
+    evidence: Dict[str, Any] = Field(default_factory=dict)
+
+
+class TopicIngestItem(BaseModel):
+    document_id: str
+    topics: List[TopicAssign]
+
+
+class TopicsIngestIn(BaseModel):
+    run_id: UUID
+    items: List[TopicIngestItem]
+    update_solr: bool = True
+    # if true, also add schema_versions_ss += topic schema version on docs
+    add_schema_version: bool = True
+
+
+class TopicActivateIn(BaseModel):
+    # If true, immediately recompute/push this run into Solr
+    push_to_solr: bool = True
+    core: str = "hitl_test"
 
 
 # ------------------------------------------------------------------------------
@@ -179,6 +252,50 @@ def chunked(xs: List[Any], n: int) -> Iterable[List[Any]]:
     for i in range(0, len(xs), n):
         yield xs[i:i + n]
 
+
+#####################################
+# hypotheis utilities for syncing
+###################################
+
+# Reuse connections + add robust retries for Hypothesis
+_HYP_SESSION = requests.Session()
+
+_HYP_RETRY = Retry(
+    total=8,
+    connect=8,
+    read=8,
+    backoff_factor=0.6,  # exponential backoff: 0.6, 1.2, 2.4, ...
+    status_forcelist=(429, 500, 502, 503, 504),
+    allowed_methods=frozenset(["GET"]),
+    respect_retry_after_header=True,
+    raise_on_status=False,
+)
+
+_HYP_ADAPTER = HTTPAdapter(
+    max_retries=_HYP_RETRY,
+    pool_connections=10,
+    pool_maxsize=10,
+)
+
+_HYP_SESSION.mount("https://", _HYP_ADAPTER)
+_HYP_SESSION.mount("http://", _HYP_ADAPTER)
+
+
+def _hyp_get(url: str, *, params: dict | None = None):
+    """
+    Hypothesis GET with retry/backoff (via urllib3 Retry).
+    Uses a (connect, read) timeout to avoid long hangs.
+    """
+    try:
+        return _HYP_SESSION.get(
+            url,
+            params=params,
+            headers=_hyp_headers(),
+            timeout=(10, 60),  # connect timeout, read timeout
+        )
+    except RequestException as e:
+        # This includes ConnectionResetError wrapped as ConnectionError, timeouts, etc.
+        raise HTTPException(status_code=502, detail=f"Hypothesis request failed: {type(e).__name__}: {e}")
 
 # ------------------------------------------------------------------------------
 # Annotations helpers - code normalisation
@@ -831,6 +948,74 @@ def solr_update_review_status(core: str, updates: list[dict]) -> int:
         updated += len(batch)
     return updated
 
+
+
+def solr_update_topics_for_docs(
+    core: str,
+    doc_to_topics: Dict[str, List[Dict[str, Any]]],
+    *,
+    run_id: str,
+    schema_version: Optional[str] = None,
+) -> int:
+    """
+    doc_to_topics: doc_id -> list of {topic_key, topic_label, score}
+    Writes:
+      - topics_ss
+      - topic_keys_ss
+      - topic_kv_ss (e.g. T01=0.82)
+      - has_topics_b
+      - topic_run_id_s
+      - schema_versions_ss (optional add)
+    """
+    if not doc_to_topics:
+        return 0
+
+    atomic_docs: List[dict] = []
+
+    for doc_id, items in doc_to_topics.items():
+        labels: List[str] = []
+        keys: List[str] = []
+        kv: List[str] = []
+
+        for it in items:
+            k = (it.get("topic_key") or "").strip()
+            lab = (it.get("topic_label") or "").strip()
+            sc = it.get("score")
+
+            if k:
+                keys.append(k)
+            if lab:
+                labels.append(lab)
+
+            if k and sc is not None:
+                try:
+                    kv.append(f"{k}={float(sc):.4f}")
+                except Exception:
+                    kv.append(f"{k}={sc}")
+
+        atomic = {
+            "document_id_s": doc_id,
+            "has_topics_b": {"set": True},
+            "topic_run_id_s": {"set": str(run_id)},
+            "topics_ss": {"set": sorted(set(labels))},
+            "topic_keys_ss": {"set": sorted(set(keys))},
+            "topic_kv_ss": {"set": sorted(set(kv))},
+        }
+
+        if schema_version:
+            atomic["schema_versions_ss"] = {"add": schema_version}
+
+        atomic_docs.append(atomic)
+
+    updated = 0
+    for batch in chunked(atomic_docs, 500):
+        solr_atomic_update(core, batch, commit_within_ms=5000)
+        updated += len(batch)
+
+    return updated
+
+
+
 # ------------------------------------------------------------------------------
 # Corpus ingestion Solr doc builder (patched)
 # ------------------------------------------------------------------------------
@@ -1133,9 +1318,12 @@ def _hyp_headers() -> Dict[str, str]:
 
 
 def hypothesis_get_profile() -> dict:
-    r = requests.get(f"{HYPOTHESIS_API_BASE}/profile", headers=_hyp_headers(), timeout=60)
+    r = _hyp_get(f"{HYPOTHESIS_API_BASE}/profile")
     if r.status_code >= 300:
-        raise HTTPException(status_code=500, detail=f"Hypothesis profile failed: {r.status_code} {r.text[:800]}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Hypothesis profile failed: {r.status_code} {r.text[:800]}",
+        )
     return r.json()
 
 
@@ -1146,6 +1334,7 @@ def hypothesis_iter_group_annotations(
 ) -> Iterable[dict]:
     """
     Incremental fetch using search_after on updated.
+    Note: search_after should be an ISO8601 string when sorting by updated. :contentReference[oaicite:1]{index=1}
     """
     params = {
         "group": group_id,
@@ -1156,10 +1345,15 @@ def hypothesis_iter_group_annotations(
     if search_after:
         params["search_after"] = search_after
 
+    last_cursor = params.get("search_after")
+
     while True:
-        r = requests.get(f"{HYPOTHESIS_API_BASE}/search", params=params, headers=_hyp_headers(), timeout=60)
+        r = _hyp_get(f"{HYPOTHESIS_API_BASE}/search", params=params)
         if r.status_code >= 300:
-            raise HTTPException(status_code=500, detail=f"Hypothesis search failed: {r.status_code} {r.text[:800]}")
+            raise HTTPException(
+                status_code=500,
+                detail=f"Hypothesis search failed: {r.status_code} {r.text[:800]}",
+            )
 
         data = r.json()
         rows = data.get("rows", []) or []
@@ -1169,10 +1363,59 @@ def hypothesis_iter_group_annotations(
         for a in rows:
             yield a
 
-        last_updated = rows[-1].get("updated")
-        if not last_updated:
+        new_cursor = rows[-1].get("updated")
+        if not new_cursor:
             break
-        params["search_after"] = last_updated
+
+        # Safety guard: avoid infinite loops if cursor doesn't advance
+        if new_cursor == last_cursor:
+            break
+
+        params["search_after"] = new_cursor
+        last_cursor = new_cursor
+
+
+# def hypothesis_get_profile() -> dict:
+#     r = requests.get(f"{HYPOTHESIS_API_BASE}/profile", headers=_hyp_headers(), timeout=60)
+#     if r.status_code >= 300:
+#         raise HTTPException(status_code=500, detail=f"Hypothesis profile failed: {r.status_code} {r.text[:800]}")
+#     return r.json()
+#
+#
+# def hypothesis_iter_group_annotations(
+#     group_id: str,
+#     limit: int = 200,
+#     search_after: Optional[str] = None,
+# ) -> Iterable[dict]:
+#     """
+#     Incremental fetch using search_after on updated.
+#     """
+#     params = {
+#         "group": group_id,
+#         "sort": "updated",
+#         "order": "asc",
+#         "limit": int(limit),
+#     }
+#     if search_after:
+#         params["search_after"] = search_after
+#
+#     while True:
+#         r = requests.get(f"{HYPOTHESIS_API_BASE}/search", params=params, headers=_hyp_headers(), timeout=60)
+#         if r.status_code >= 300:
+#             raise HTTPException(status_code=500, detail=f"Hypothesis search failed: {r.status_code} {r.text[:800]}")
+#
+#         data = r.json()
+#         rows = data.get("rows", []) or []
+#         if not rows:
+#             break
+#
+#         for a in rows:
+#             yield a
+#
+#         last_updated = rows[-1].get("updated")
+#         if not last_updated:
+#             break
+#         params["search_after"] = last_updated
 
 
 def snapshot_path_for_group(group_id: str) -> str:
@@ -1763,6 +2006,7 @@ def hypothesis_sync_stream(payload: HypothesisSyncRequest):
                 result = run_hypothesis_sync(payload, emit=emit)
                 q.put(sse_event("result", result))
             except Exception as e:
+                logger.exception("hypothesis sync failed")
                 q.put(sse_event("error", {"error": str(e)}))
             finally:
                 done.set()
@@ -2557,6 +2801,11 @@ def search(
                 "codes_ext_ss",
                 "codes_all_ss",
                 "project_ids_ss",
+                "topics_ss",
+                "topic_keys_ss",
+                "topic_kv_ss",
+                "topic_run_id_s",
+                "has_topics_b"
             ]
         ),
         "facet": "true",
@@ -2569,6 +2818,7 @@ def search(
             "has_human_b",
             "codes_all_ss",
             "appeal_outcome_s",
+            "topics_ss"
         ],
     }
 
@@ -3016,5 +3266,805 @@ def project_review_stats(project_id: UUID):
             counts.setdefault(k, 0)
 
         return {"ok": True, "project_id": str(project_id), "counts": counts}
+    finally:
+        db.close()
+
+
+##########################Topic Models end points
+
+
+@app.post("/topics/runs", response_model=TopicRunOut)
+def create_topic_run(payload: TopicRunCreateIn):
+    db = SessionLocal()
+    try:
+        row = TopicRun(
+            project_id=payload.project_id,
+            name=payload.name.strip(),
+            topic_schema_version=payload.topic_schema_version.strip() or "topics-v1",
+            method=(payload.method or "external").strip(),
+            model=(payload.model.strip() if payload.model else None),
+            params=payload.params or {},
+            is_active=False,
+            created_by=payload.created_by,
+        )
+        db.add(row)
+        db.commit()
+
+        return TopicRunOut(
+            run_id=str(row.run_id),
+            project_id=str(row.project_id) if row.project_id else None,
+            name=row.name,
+            topic_schema_version=row.topic_schema_version,
+            method=row.method,
+            model=row.model,
+            params=row.params or {},
+            is_active=bool(row.is_active),
+            created_at=iso_z(row.created_at) if getattr(row, "created_at", None) else None,
+        )
+    finally:
+        db.close()
+
+
+@app.get("/topics/runs")
+def list_topic_runs(project_id: Optional[UUID] = None):
+    db = SessionLocal()
+    try:
+        q = select(TopicRun)
+        if project_id:
+            q = q.where(TopicRun.project_id == project_id)
+        q = q.order_by(TopicRun.created_at.desc())
+
+        rows = db.execute(q).scalars().all()
+        out = []
+        for r in rows:
+            out.append({
+                "run_id": str(r.run_id),
+                "project_id": str(r.project_id) if r.project_id else None,
+                "name": r.name,
+                "topic_schema_version": r.topic_schema_version,
+                "method": r.method,
+                "model": r.model,
+                "params": r.params or {},
+                "is_active": bool(r.is_active),
+                "created_at": iso_z(r.created_at) if getattr(r, "created_at", None) else None,
+            })
+        return {"ok": True, "runs": out}
+    finally:
+        db.close()
+
+
+@app.post("/topics/runs/{run_id}/activate")
+def activate_topic_run(run_id: UUID, payload: TopicActivateIn):
+    """
+    Marks this run active (within its scope), and optionally pushes its topics to Solr.
+    Scope rule:
+      - if run.project_id is set: deactivate other runs with same project_id
+      - else: deactivate other global runs (project_id is null)
+    """
+    db = SessionLocal()
+    try:
+        run = db.get(TopicRun, run_id)
+        if not run:
+            raise HTTPException(404, "topic run not found")
+
+        # Deactivate others in same scope
+        if run.project_id:
+            others = db.execute(
+                select(TopicRun).where(TopicRun.project_id == run.project_id).where(TopicRun.run_id != run_id)
+            ).scalars().all()
+        else:
+            others = db.execute(
+                select(TopicRun).where(TopicRun.project_id.is_(None)).where(TopicRun.run_id != run_id)
+            ).scalars().all()
+
+        for o in others:
+            o.is_active = False
+        run.is_active = True
+        db.commit()
+
+        solr_updated = 0
+        if payload.push_to_solr:
+            # recompute/push for this run
+            solr_updated = _recompute_topics_to_solr(db, core=payload.core, run_id=run_id)
+
+        return {
+            "ok": True,
+            "run_id": str(run_id),
+            "project_id": str(run.project_id) if run.project_id else None,
+            "is_active": True,
+            "pushed_to_solr": bool(payload.push_to_solr),
+            "solr_docs_updated": solr_updated,
+        }
+    finally:
+        db.close()
+
+
+@app.post("/topics/ingest")
+def ingest_topics(payload: TopicsIngestIn, core: str = "hitl_test"):
+    """
+    Bulk upsert document topic assignments into Postgres.
+    Optionally push derived fields into Solr for filtering/faceting.
+    """
+    db = SessionLocal()
+    try:
+        run = db.get(TopicRun, payload.run_id)
+        if not run:
+            raise HTTPException(404, "topic run not found")
+
+        # validate docs exist (fast safety)
+        doc_ids = [it.document_id for it in payload.items if it.document_id]
+        existing = set(
+            db.execute(select(Document.document_id).where(Document.document_id.in_(doc_ids))).scalars().all()
+        )
+        missing = [d for d in doc_ids if d not in existing]
+        if missing:
+            raise HTTPException(400, {"error": "some document_ids not found", "missing": missing[:20]})
+
+        upserted = 0
+
+        # naive upsert (works fine at moderate scale)
+        # If you need big scale, we can switch to psycopg COPY or SQL upsert.
+        for item in payload.items:
+            did = item.document_id.strip()
+            for t in item.topics:
+                key = (t.topic_key or "").strip()
+                lab = (t.topic_label or "").strip()
+                if not did or not key or not lab:
+                    continue
+
+                row = db.get(
+                    DocumentTopic,
+                    {"run_id": payload.run_id, "document_id": did, "topic_key": key},
+                )
+
+                # 1) Hard blocklist: never resurrect rejected/deleted (for any type)
+                if row and row.status in ("rejected", "deleted"):
+                    continue
+
+                # 2) Never overwrite an active human label from external/model ingest
+                if row and row.assignment_type == "human" and row.status == "active":
+                    continue
+
+                src = (t.source or "model").strip()
+                ev = t.evidence or {}
+
+                if row:
+                    # Safe to update only AUTO rows that are active
+                    row.topic_label = lab
+                    row.score = t.score
+                    row.source = src
+                    row.evidence = ev
+
+                    # Make ingest behavior explicit/predictable
+                    row.assignment_type = "auto"
+                    row.status = "active"
+                    row.reason = "bulk_ingest"
+                    row.updated_by = None  # or set to a service user if you have one
+                else:
+                    db.add(DocumentTopic(
+                        run_id=payload.run_id,
+                        document_id=did,
+                        topic_key=key,
+                        topic_label=lab,
+                        score=t.score,
+                        source=src,
+                        evidence=ev,
+
+                        # Explicit, predictable defaults for ingest
+                        assignment_type="auto",
+                        status="active",
+                        reason="bulk_ingest",
+                        created_by=None,  # or service user
+                        updated_by=None,
+                    ))
+
+                upserted += 1
+
+        db.commit()
+
+        solr_updated = 0
+        if payload.update_solr:
+            # push only docs present in this ingest batch (fast)
+            doc_to_topics: Dict[str, List[Dict[str, Any]]] = {}
+            for item in payload.items:
+                did = item.document_id.strip()
+                items = []
+                for t in item.topics:
+                    if not t.topic_key or not t.topic_label:
+                        continue
+                    items.append({
+                        "topic_key": t.topic_key,
+                        "topic_label": t.topic_label,
+                        "score": t.score,
+                    })
+                if items:
+                    doc_to_topics[did] = items
+
+            schema_v = run.topic_schema_version if payload.add_schema_version else None
+            solr_updated = solr_update_topics_for_docs(
+                core=core,
+                doc_to_topics=doc_to_topics,
+                run_id=str(payload.run_id),
+                schema_version=schema_v,
+            )
+
+        return {
+            "ok": True,
+            "run_id": str(payload.run_id),
+            "topics_rows_upserted": upserted,
+            "solr_docs_updated": solr_updated,
+        }
+    finally:
+        db.close()
+
+
+
+def _recompute_topics_to_solr(db, *, core: str, run_id: UUID, project_id: Optional[UUID] = None) -> int:
+    run = db.get(TopicRun, run_id)
+    if not run:
+        raise HTTPException(404, "topic run not found")
+
+    # doc scope: if project_id specified, intersect with project documents
+    doc_scope: Optional[set[str]] = None
+    if project_id:
+        doc_scope = set(
+            db.execute(select(ProjectDocument.document_id).where(ProjectDocument.project_id == project_id)).scalars().all()
+        )
+
+    stmt = select(
+        DocumentTopic.document_id,
+        DocumentTopic.topic_key,
+        DocumentTopic.topic_label,
+        DocumentTopic.score,
+    ).where(DocumentTopic.run_id == run_id)
+
+    doc_to_topics: Dict[str, List[Dict[str, Any]]] = {}
+    scanned = 0
+
+    for did, tkey, tlab, score in db.execute(stmt).yield_per(5000):
+        scanned += 1
+        if not did:
+            continue
+        if doc_scope is not None and did not in doc_scope:
+            continue
+        bucket = doc_to_topics.setdefault(str(did), [])
+        bucket.append({"topic_key": tkey, "topic_label": tlab, "score": score})
+
+    schema_v = run.topic_schema_version
+    return solr_update_topics_for_docs(
+        core=core,
+        doc_to_topics=doc_to_topics,
+        run_id=str(run_id),
+        schema_version=schema_v,
+    )
+
+
+@app.post("/solr/recompute_topics")
+def recompute_solr_topics(
+    core: str = "hitl_test",
+    run_id: UUID = None,
+    project_id: Optional[UUID] = None,
+):
+    """
+    Recompute Solr topics_* purely from Postgres document_topics for a given run_id.
+    Optional project_id scopes to docs in that project.
+    """
+    if not run_id:
+        raise HTTPException(400, "run_id is required")
+
+    db = SessionLocal()
+    try:
+        updated = _recompute_topics_to_solr(db, core=core, run_id=run_id, project_id=project_id)
+        return {
+            "ok": True,
+            "core": core,
+            "run_id": str(run_id),
+            "project_id": str(project_id) if project_id else None,
+            "docs_updated_in_solr": updated,
+        }
+    finally:
+        db.close()
+
+
+
+@app.get("/documents/{document_id}/topics")
+def get_document_topics(document_id: str, run_id: UUID):
+    db = SessionLocal()
+    try:
+        run = db.get(TopicRun, run_id)
+        if not run:
+            raise HTTPException(404, "topic run not found")
+
+        rows = db.execute(
+            select(
+                DocumentTopic.topic_key,
+                DocumentTopic.topic_label,
+                DocumentTopic.score,
+                DocumentTopic.source,
+                DocumentTopic.evidence,
+                DocumentTopic.updated_at,
+            )
+            .where(DocumentTopic.run_id == run_id)
+            .where(DocumentTopic.document_id == document_id)
+            .order_by(DocumentTopic.score.desc().nullslast(), DocumentTopic.topic_key.asc())
+        ).all()
+
+        return {
+            "ok": True,
+            "run_id": str(run_id),
+            "document_id": document_id,
+            "topics": [
+                {
+                    "topic_key": k,
+                    "topic_label": lab,
+                    "score": sc,
+                    "source": src,
+                    "evidence": ev or {},
+                    "updated_at": iso_z(u) if u else None,
+                }
+                for (k, lab, sc, src, ev, u) in rows
+            ],
+        }
+    finally:
+        db.close()
+
+
+################################ HITL topics modelling #########
+class TopicHumanLabelIn(BaseModel):
+    run_id: UUID
+    document_id: str
+    topic_key: str
+    topic_label: str
+    user: Optional[str] = None
+
+
+class TopicHumanDeleteIn(BaseModel):
+    run_id: UUID
+    document_id: str
+    topic_key: str
+    user: Optional[str] = None
+
+
+class TopicSuggestOut(BaseModel):
+    document_id: str
+    score: float
+
+# E2) Helpers: embeddings decode + centroid
+import numpy as np
+from .faiss_store import search_centroid
+
+# EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2").strip()
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2").strip()
+HARD_BLOCK_STATUSES = {"rejected", "deleted"}
+MIN_HUMAN_LABELS_FOR_PROP = 2
+
+
+def _bytes_to_vec(b: bytes, dim: int) -> np.ndarray:
+    v = np.frombuffer(b, dtype=np.float32)
+    if v.shape[0] != dim:
+        raise ValueError(f"embedding dim mismatch: {v.shape[0]} vs {dim}")
+    return v
+
+def _l2_normalize(v: np.ndarray) -> np.ndarray:
+    n = float(np.linalg.norm(v))
+    if n <= 0:
+        return v
+    return v / n
+
+def _topic_centroid_from_humans(db, run_id: UUID, topic_key: str) -> Optional[np.ndarray]:
+    """
+    returns L2-normalized centroid vector or None if not enough data
+    """
+    # 1) get human-labeled docs for this topic
+    human_docs = db.execute(
+        select(DocumentTopic.document_id)
+        .where(DocumentTopic.run_id == run_id)
+        .where(DocumentTopic.topic_key == topic_key)
+        .where(DocumentTopic.assignment_type == "human")
+        .where(DocumentTopic.status == "active")
+    ).scalars().all()
+
+    if not human_docs:
+        return None
+
+    # 2) fetch embeddings
+    rows = db.execute(
+        select(DocEmbedding.embedding_dim, DocEmbedding.embedding)
+        .where(DocEmbedding.document_id.in_(human_docs))
+        .where(DocEmbedding.model == EMBEDDING_MODEL)
+    ).all()
+
+    if not rows:
+        return None
+
+    dim = rows[0][0]
+    vecs = []
+    for d, b in rows:
+        if d != dim:
+            continue
+        vecs.append(_bytes_to_vec(b, dim))
+
+    if not vecs:
+        return None
+
+    if len(vecs) < MIN_HUMAN_LABELS_FOR_PROP:
+        return None
+
+    centroid = np.mean(np.stack(vecs, axis=0), axis=0).astype(np.float32)
+    centroid = _l2_normalize(centroid)
+    return centroid
+
+
+
+
+
+def _is_hard_blocked(decisions: list[tuple[str, str]]) -> bool:
+    """
+    decisions: list of (assignment_type, status) for a given (run_id, doc_id, topic_key)
+    Hard block means: user explicitly said 'never add again' unless they add a new HUMAN label.
+    """
+    return any(st in HARD_BLOCK_STATUSES for (_atype, st) in (decisions or []))
+
+
+# E3) Propagation: compute centroid → FAISS → upsert auto labels → update Solr
+def _propagate_topic(db, *, core: str, run_id: UUID, topic_key: str, topic_label: str,
+                     k: int = 200, min_score: float = 0.35) -> Dict[str, Any]:
+    """
+    1) centroid from human labels
+    2) FAISS search
+    3) upsert auto labels (active) excluding: human active, any rejected/deleted rows
+    4) push to Solr for affected docs
+    """
+    centroid = _topic_centroid_from_humans(db, run_id, topic_key)
+    if centroid is None:
+        return {"ok": True, "propagated": 0, "reason": "no centroid (no human labels or missing embeddings)"}
+
+    hits = search_centroid(centroid, k=k)
+
+    # Exclusions: any existing decision rows for this (doc, topic) where status != active? (rejected/deleted)
+    existing_rows = db.execute(
+        select(DocumentTopic.document_id, DocumentTopic.assignment_type, DocumentTopic.status)
+        .where(DocumentTopic.run_id == run_id)
+        .where(DocumentTopic.topic_key == topic_key)
+    ).all()
+
+    existing = {}  # doc_id -> list[(type,status)]
+    for did, atype, st in existing_rows:
+        existing.setdefault(did, []).append((atype, st))
+
+    to_upsert: List[Tuple[str, float]] = []
+    for did, score in hits:
+        if score < min_score:
+            continue
+
+        decisions = existing.get(did, [])
+
+        # If human active exists => leave it
+        if any(t == "human" and s == "active" for (t, s) in decisions):
+            continue
+
+        # If user rejected/deleted previously => do not re-add automatically
+        if _is_hard_blocked(decisions):
+            continue
+
+        to_upsert.append((did, score))
+
+    # Upsert auto labels
+    up = 0
+    for did, score in to_upsert:
+        row = db.execute(
+            select(DocumentTopic)
+            .where(DocumentTopic.run_id == run_id)
+            .where(DocumentTopic.document_id == did)
+            .where(DocumentTopic.topic_key == topic_key)
+            .where(DocumentTopic.assignment_type == "auto")
+        ).scalars().first()
+
+        if row:
+            row.topic_label = topic_label
+            row.score = score
+            row.status = "active"
+            row.reason = "faiss_centroid"
+        else:
+            db.add(DocumentTopic(
+                run_id=run_id,
+                document_id=did,
+                topic_key=topic_key,
+                topic_label=topic_label,
+                score=score,
+                source="auto",
+                evidence={
+                    "method": "faiss_centroid",
+                    "embedding_model": EMBEDDING_MODEL,
+                    "score": float(score),
+                    "min_score": float(min_score),
+                    "k": int(k),
+                    "topic_key": topic_key
+                },
+                assignment_type="auto",
+                status="active",
+                reason="propagation"
+            ))
+        up += 1
+
+    db.commit()
+
+    # Push to Solr for these docs (union topics per doc should be rebuilt)
+    # Simplest approach: recompute topics for these docs only.
+    # We'll do a per-doc rebuild (human + auto active) and atomic update.
+    affected_doc_ids = [did for did, _ in to_upsert]
+    solr_updated = _push_topics_for_docs(db, core=core, run_id=run_id, document_ids=affected_doc_ids)
+
+    return {"ok": True, "propagated": up, "solr_docs_updated": solr_updated}
+
+# E4) Push topics for a set of docs (human+auto active)
+# This avoids stale topic values without doing a full run recompute.
+
+def _push_topics_for_docs(db, *, core: str, run_id: UUID, document_ids: List[str]) -> int:
+    if not document_ids:
+        return 0
+
+    rows = db.execute(
+        select(
+            DocumentTopic.document_id,
+            DocumentTopic.topic_key,
+            DocumentTopic.topic_label,
+            DocumentTopic.score,
+            DocumentTopic.assignment_type,
+        )
+        .where(DocumentTopic.run_id == run_id)
+        .where(DocumentTopic.document_id.in_(document_ids))
+        .where(DocumentTopic.status == "active")
+    ).all()
+
+    doc_to = {}
+    for did, k, lab, sc, atype in rows:
+        doc_to.setdefault(did, []).append({"topic_key": k, "topic_label": lab, "score": sc})
+
+    # Important: clear docs that now have zero active topics
+    docs_with_topics = set(doc_to.keys())
+    docs_without = [d for d in document_ids if d not in docs_with_topics]
+
+    updated = solr_update_topics_for_docs(
+        core=core,
+        doc_to_topics=doc_to,
+        run_id=str(run_id),
+        schema_version=None,  # optional
+    )
+
+    if docs_without:
+        clears = []
+        for did in docs_without:
+            clears.append({
+                "document_id_s": did,
+                "has_topics_b": {"set": False},
+                "topic_run_id_s": {"set": str(run_id)},
+                "topics_ss": {"set": []},
+                "topic_keys_ss": {"set": []},
+                "topic_kv_ss": {"set": []},
+            })
+        for batch in chunked(clears, 500):
+            solr_atomic_update(core, batch, commit_within_ms=5000)
+            updated += len(batch)
+
+    return updated
+
+
+# G) The actual user endpoints
+# G1) Human assign → propagate → update Solr
+
+@app.post("/topics/label")
+def topic_human_label(payload: TopicHumanLabelIn, core: str = SOLR_GLOBAL_CORE,
+                      k: int = 200, min_score: float = 0.35):
+    db = SessionLocal()
+    try:
+        # Ensure doc exists
+        doc = db.get(Document, payload.document_id)
+        if not doc:
+            raise HTTPException(400, f"document_id not found: {payload.document_id}")
+
+        # Upsert human active
+        row = db.execute(
+            select(DocumentTopic)
+            .where(DocumentTopic.run_id == payload.run_id)
+            .where(DocumentTopic.document_id == payload.document_id)
+            .where(DocumentTopic.topic_key == payload.topic_key)
+            .where(DocumentTopic.assignment_type == "human")
+        ).scalars().first()
+
+        if row:
+            # row.topic_label = t["topic_label"]
+            # row.score = t.get("score")
+            # row.source = "external"
+            # row.evidence = t.get("evidence") or {}
+            # row.assignment_type = "auto"
+            # row.status = "active"
+            # row.reason = "bulk_ingest"
+            row.topic_label = payload.topic_label
+            row.score = None  # human label -> score optional; keep None
+            row.assignment_type = "human"
+            row.status = "active"
+            row.updated_by = payload.user
+            row.reason = "human_label"
+            row.source = "human"
+            row.evidence = {"action": "label", "user": payload.user}
+
+        else:
+            db.add(DocumentTopic(
+                run_id=payload.run_id,
+                document_id=payload.document_id,
+                topic_key=payload.topic_key,
+                topic_label=payload.topic_label,
+                score=None,
+                assignment_type="human",
+                status="active",
+                created_by=payload.user,
+                updated_by=payload.user,
+                reason="human_label",
+                source="human",
+                evidence={"action": "label", "user": payload.user},
+            ))
+
+            # db.add(DocumentTopic(
+            #     run_id=payload.run_id,
+            #     document_id=payload.document_id,
+            #     topic_key=payload.topic_key,
+            #     topic_label=payload.topic_label,
+            #     score=None,
+            #     assignment_type="human",
+            #     status="active",
+            #     created_by=payload.user,
+            #     reason="human",
+            # ))
+        db.commit()
+
+        # Propagate topic based on centroid
+        prop = _propagate_topic(
+            db,
+            core=core,
+            run_id=payload.run_id,
+            topic_key=payload.topic_key,
+            topic_label=payload.topic_label,
+            k=k,
+            min_score=min_score,
+        )
+
+        # Also push topics for the labeled doc itself (human immediate)
+        _push_topics_for_docs(db, core=core, run_id=payload.run_id, document_ids=[payload.document_id])
+
+        return {"ok": True, "human_labeled": True, "propagation": prop}
+    finally:
+        db.close()
+
+
+# G2) Human delete → propagate → update Solr
+@app.delete("/topics/label")
+def topic_human_delete(payload: TopicHumanDeleteIn, core: str = SOLR_GLOBAL_CORE,
+                       k: int = 200, min_score: float = 0.35):
+    db = SessionLocal()
+    try:
+        row = db.execute(
+            select(DocumentTopic)
+            .where(DocumentTopic.run_id == payload.run_id)
+            .where(DocumentTopic.document_id == payload.document_id)
+            .where(DocumentTopic.topic_key == payload.topic_key)
+            .where(DocumentTopic.assignment_type == "human")
+        ).scalars().first()
+
+        if not row:
+            return {"ok": True, "human_deleted": False, "reason": "no human label existed"}
+
+        # row.status = "deleted"
+        # row.updated_by = payload.user
+        # db.commit()
+        # Mark as human-deleted (soft delete, preserves audit and blocks auto resurrect)
+        row.assignment_type = "human"
+        row.status = "deleted"
+        row.updated_by = payload.user
+        row.reason = "human_deleted"
+        row.source = "human"
+        row.evidence = {"action": "delete", "user": payload.user}
+        db.commit()
+
+        # Repropagate topic (centroid changed)
+        prop = _propagate_topic(
+            db,
+            core=core,
+            run_id=payload.run_id,
+            topic_key=payload.topic_key,
+            topic_label=row.topic_label,
+            k=k,
+            min_score=min_score,
+        )
+
+        # Push topics for this doc (it may lose the topic)
+        _push_topics_for_docs(db, core=core, run_id=payload.run_id, document_ids=[payload.document_id])
+
+        return {"ok": True, "human_deleted": True, "propagation": prop}
+    finally:
+        db.close()
+
+# G3) Suggestions-only endpoint (for UI preview)
+# Does not write anything.
+
+@app.get("/topics/{run_id}/{topic_key}/suggestions")
+def topic_suggestions(run_id: UUID, topic_key: str, k: int = 200, min_score: float = 0.35):
+    db = SessionLocal()
+    try:
+        # Need a topic_label; take from any existing human row if present
+        any_label = db.execute(
+            select(DocumentTopic.topic_label)
+            .where(DocumentTopic.run_id == run_id)
+            .where(DocumentTopic.topic_key == topic_key)
+            .where(DocumentTopic.assignment_type == "human")
+        ).scalars().first()
+
+        if not any_label:
+            raise HTTPException(400, "No human labels exist for this topic_key yet (cannot build centroid).")
+
+        centroid = _topic_centroid_from_humans(db, run_id, topic_key)
+        if centroid is None:
+            return {
+                "ok": True,
+                "propagated": 0,
+                "reason": f"no centroid (need >= {MIN_HUMAN_LABELS_FOR_PROP} active human labels with embeddings)"
+            }
+
+        hits = search_centroid(centroid, k=k)
+        out = [{"document_id": did, "score": sc} for did, sc in hits if sc >= min_score]
+        return {"ok": True, "topic_key": topic_key, "topic_label": any_label, "suggestions": out}
+    finally:
+        db.close()
+
+class TopicRejectIn(BaseModel):
+    run_id: UUID
+    document_id: str
+    topic_key: str
+    user: Optional[str] = None
+
+
+@app.post("/topics/reject")
+def topic_reject(payload: TopicRejectIn, core: str = "hitl_test"):
+    db = SessionLocal()
+    try:
+        row = db.execute(
+            select(DocumentTopic)
+            .where(DocumentTopic.run_id == payload.run_id)
+            .where(DocumentTopic.document_id == payload.document_id)
+            .where(DocumentTopic.topic_key == payload.topic_key)
+        ).scalars().first()
+
+        if row:
+            # if human active exists, do NOT allow reject to wipe it
+            if row.assignment_type == "human" and row.status == "active":
+                raise HTTPException(400, "Cannot reject an active human label. Delete it instead.")
+            row.assignment_type = "auto"
+            row.status = "rejected"
+            row.updated_by = payload.user
+            row.reason = "user_rejected"
+            row.source = "human"
+            row.evidence = {"action": "reject", "user": payload.user}
+        else:
+            # create a tombstone so propagation won't re-add it
+            db.add(DocumentTopic(
+                run_id=payload.run_id,
+                document_id=payload.document_id,
+                topic_key=payload.topic_key,
+                topic_label="(rejected)",
+                score=None,
+                source="human",
+                evidence={"action": "reject", "user": payload.user},
+                assignment_type="auto",
+                status="rejected",
+                reason="user_rejected",
+                created_by=payload.user,
+            ))
+
+        db.commit()
+
+        # Push Solr rebuild for this doc so the topic disappears immediately
+        _push_topics_for_docs(db, core=core, run_id=payload.run_id, document_ids=[payload.document_id])
+
+        return {"ok": True, "rejected": True}
     finally:
         db.close()

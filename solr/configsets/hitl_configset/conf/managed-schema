@@ -35,8 +35,14 @@
   <field name="case_numbers_ss" type="string" docValues="true" multiValued="true" indexed="true" stored="true"/>
   <field name="citation_references_ss" type="string" docValues="true" multiValued="true" indexed="true" stored="true"/>
   <field name="citation_s" type="string" docValues="true" indexed="true" stored="true"/>
+  <field name="code_value_human_kv_ss" type="string" multiValued="true" indexed="true" stored="true"/>
+  <field name="code_value_human_norm_kv_ss" type="string" docValues="true" multiValued="true" indexed="true" stored="true"/>
+  <field name="code_value_model_kv_ss" type="string" multiValued="true" indexed="true" stored="true"/>
+  <field name="code_value_model_norm_kv_ss" type="string" docValues="true" multiValued="true" indexed="true" stored="true"/>
   <field name="codes_all_ss" type="string" multiValued="true" indexed="true" stored="true"/>
   <field name="codes_ext_ss" type="string" multiValued="true" indexed="true" stored="true"/>
+  <field name="codes_present_human_ss" type="string" multiValued="true" indexed="true" stored="true"/>
+  <field name="codes_present_model_ss" type="string" multiValued="true" indexed="true" stored="true"/>
   <field name="codes_v1_ss" type="string" multiValued="true" indexed="true" stored="true"/>
   <field name="doc_type_s" type="string" docValues="true" indexed="true" stored="true"/>
   <field name="document_id_s" type="string" multiValued="false" indexed="true" required="true" stored="true"/>
@@ -45,6 +51,7 @@
   <field name="has_any_span_b" type="boolean" default="false" indexed="true" stored="true"/>
   <field name="has_human_b" type="boolean" default="false" indexed="true" stored="true"/>
   <field name="has_model_b" type="boolean" default="false" indexed="true" stored="true"/>
+  <field name="has_topics_b" type="boolean" docValues="true" multiValued="false" indexed="true" stored="true"/>
   <field name="ingested_dt" type="pdate" indexed="true" stored="true"/>
   <field name="judges_ss" type="string" docValues="true" multiValued="true" indexed="true" stored="true"/>
   <field name="legislation_ss" type="string" docValues="true" multiValued="true" indexed="true" stored="true"/>
@@ -56,6 +63,14 @@
   <field name="signature_s" type="string" docValues="true" indexed="true" stored="true"/>
   <field name="source_s" type="string" docValues="true" indexed="true" stored="true"/>
   <field name="title_txt" type="text_general" indexed="true" stored="true"/>
+  <field name="topic_keys_ss" type="string" docValues="true" multiValued="true" indexed="true" stored="true"/>
+  <field name="topic_kv_ss" type="string" docValues="true" multiValued="true" indexed="true" stored="true"/>
+  <field name="topic_run_id_s" type="string" docValues="true" multiValued="false" indexed="true" stored="true"/>
+  <field name="topics_ss" type="string" docValues="true" multiValued="true" indexed="true" stored="true"/>
+  <field name="values_human_norm_txt" type="text_general" multiValued="false" indexed="true" stored="false"/>
+  <field name="values_human_txt" type="text_general" indexed="true" stored="false"/>
+  <field name="values_model_norm_txt" type="text_general" multiValued="false" indexed="true" stored="false"/>
+  <field name="values_model_txt" type="text_general" indexed="true" stored="false"/>
   <field name="xml_uri_s" type="string" docValues="true" indexed="true" stored="true"/>
   <copyField source="body_txt" dest="_text_"/>
   <copyField source="excerpt_txt" dest="body_txt"/>

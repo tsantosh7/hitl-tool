@@ -1,27 +1,29 @@
 # api/app/models.py
+
 import uuid
 from datetime import datetime
 
 from sqlalchemy import (
-    Column,
-    String,
-    Date,
-    Text,
-    JSON,
-    ForeignKey,
     Boolean,
+    Column,
+    Date,
     DateTime,
+    Float,
+    ForeignKey,
+    Integer,
+    JSON,
+    LargeBinary,
+    String,
+    Text,
+    UniqueConstraint,
 )
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship
+from sqlalchemy.sql import func
 
-from .db import Base
-from sqlalchemy import UniqueConstraint
 from pydantic import BaseModel, Field
 
-from sqlalchemy import Column, String, DateTime, ForeignKey
-from sqlalchemy.dialects.postgresql import UUID
-from sqlalchemy.sql import func
+from .db import Base
 
 
 class Team(Base):
@@ -170,3 +172,65 @@ class ProjectDocumentReview(Base):
     status = Column(String, nullable=False, default="unseen")  # unseen|in_progress|done|disputed
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
     updated_by = Column(String, nullable=True)
+
+
+# --- Topic Assignment models ---
+
+
+class TopicRun(Base):
+    __tablename__ = "topic_runs"
+
+    run_id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+
+    # If null => "global" run; if set => project-scoped run
+    project_id = Column(UUID(as_uuid=True), ForeignKey("projects.project_id"), nullable=True)
+
+    name = Column(String, nullable=False)
+    topic_schema_version = Column(String, nullable=False, default="topics-v1")
+
+    method = Column(String, nullable=False, default="external")  # llm|lda|bertopic|rules|external
+    model = Column(String, nullable=True)
+    params = Column(JSON, nullable=False, default=dict)
+
+    # activation: the run whose topics are pushed into Solr for search/filter
+    is_active = Column(Boolean, nullable=False, default=False)
+
+    created_by = Column(String, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class DocumentTopic(Base):
+    __tablename__ = "document_topics"
+
+    run_id = Column(UUID(as_uuid=True), ForeignKey("topic_runs.run_id"), primary_key=True)
+    document_id = Column(String, ForeignKey("documents.document_id"), primary_key=True)
+
+    topic_key = Column(String, primary_key=True)
+    topic_label = Column(String, nullable=False)
+    score = Column(Float, nullable=True)
+
+    # keep source/evidence if you still want them
+    source = Column(String, nullable=False, default="model")
+    evidence = Column(JSON, nullable=False, default=dict)
+
+    # ✅ NEW (matches your ALTER TABLE + main.py usage)
+    assignment_type = Column(Text, nullable=False, default="auto")     # auto|human
+    status = Column(Text, nullable=False, default="active")            # active|deleted|rejected
+    created_by = Column(Text, nullable=True)
+    updated_by = Column(Text, nullable=True)
+    reason = Column(Text, nullable=True)
+
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+
+
+class DocEmbedding(Base):
+    __tablename__ = "doc_embeddings"
+    document_id = Column(String, ForeignKey("documents.document_id"), primary_key=True)
+    embedding_dim = Column(Integer, nullable=False)
+    model = Column(String, nullable=False)
+    embedding = Column(LargeBinary, nullable=False)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
