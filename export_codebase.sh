@@ -56,6 +56,7 @@ find . \
     -o -name "*.cfg" \
     -o -name "*.md" \
     -o -name "*.txt" \
+    -o -name "*.html" \
     -o -name "managed-schema" \
   \) -print \
 | sort \

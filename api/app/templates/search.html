@@ -1,0 +1,212 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Search Documents</h1>
+
+<form method="get" class="card">
+  <div class="row">
+    <div class="grow">
+      <label class="muted">Keyword</label>
+      <input name="kw" value="{{ kw or '' }}" placeholder="Type keywords (e.g., fraud sentencing appeal)">
+      <div class="muted" style="margin-top:6px;">
+        Tip: Use normal words. Searches full text + human/model extracted values.
+      </div>
+
+      <div style="margin-top:10px;">
+        <label class="muted" style="display:flex; gap:8px; align-items:center;">
+          <input
+            type="checkbox"
+            name="include_codes_topics"
+            value="1"
+            {% if include_codes_topics == "1" or include_codes_topics is none %}checked{% endif %}
+            style="width:auto; margin:0;"
+          >
+          Also match Codes and Topics
+        </label>
+        <div class="muted" style="margin-top:6px;">
+          Example: typing <span class="mono">T01</span> or a code/topic name will match coded documents.
+        </div>
+      </div>
+    </div>
+
+    <div style="min-width:220px;">
+      <label class="muted">In</label>
+      <select name="kw_field">
+        <option value="all" {% if kw_field == "all" %}selected{% endif %}>Everything (recommended)</option>
+        <option value="title" {% if kw_field == "title" %}selected{% endif %}>Title only</option>
+        <option value="excerpt" {% if kw_field == "excerpt" %}selected{% endif %}>Excerpt only</option>
+        <option value="body" {% if kw_field == "body" %}selected{% endif %}>Body text only</option>
+        <option value="values" {% if kw_field == "values" %}selected{% endif %}>Human/Model values only</option>
+        <option value="url" {% if kw_field == "url" %}selected{% endif %}>URL only</option>
+        <option value="id" {% if kw_field == "id" %}selected{% endif %}>Document ID</option>
+      </select>
+    </div>
+
+    <div style="min-width:140px;">
+      <label class="muted">&nbsp;</label>
+      <button type="submit" style="width:100%;">Search</button>
+    </div>
+  </div>
+
+  <details style="margin-top:10px;">
+    <summary class="muted" style="cursor:pointer;">Advanced (Solr query)</summary>
+    <div style="margin-top:10px;">
+      <label class="muted">Solr query</label>
+      <input name="q" value="{{ q if q else '' }}" placeholder='e.g. title_txt:"fraud" AND source_s:"X"'>
+      <div class="muted" style="margin-top:6px;">If filled, Advanced query overrides Keyword search.</div>
+    </div>
+  </details>
+
+  <label class="muted">Scope</label>
+  <select name="scope">
+    <option value="all" {% if scope == "all" %}selected{% endif %}>All corpus</option>
+    <option value="project" {% if scope == "project" %}selected{% endif %}>
+      Current project{% if project_name %}: {{ project_name }}{% endif %}
+    </option>
+  </select>
+
+  <div class="row">
+    <div class="grow">
+      <label class="muted">Code</label>
+      <select name="code">
+        <option value="">(any)</option>
+        {% set code_f = facets.get("codes_all_ss") or [] %}
+        {% for i in range(0, code_f|length, 2) %}
+          {% set val = code_f[i] %}
+          {% set cnt = code_f[i+1] if (i+1) < (code_f|length) else 0 %}
+          <option value="{{ val }}" {% if code == val %}selected{% endif %}>{{ val }} ({{ cnt }})</option>
+        {% endfor %}
+      </select>
+      {% if (code_f|length) == 0 %}
+        <div class="muted" style="margin-top:6px;">No codes in current results</div>
+      {% endif %}
+    </div>
+
+    <div class="grow">
+      <label class="muted">Topic</label>
+      <select name="topic">
+        <option value="">(any)</option>
+        {% set topic_f = facets.get("topics_ss") or [] %}
+        {% for i in range(0, topic_f|length, 2) %}
+          {% set val = topic_f[i] %}
+          {% set cnt = topic_f[i+1] if (i+1) < (topic_f|length) else 0 %}
+          <option value="{{ val }}" {% if topic == val %}selected{% endif %}>{{ val }} ({{ cnt }})</option>
+        {% endfor %}
+      </select>
+      {% if (topic_f|length) == 0 %}
+        <div class="muted" style="margin-top:6px;">No topics in current results</div>
+      {% endif %}
+    </div>
+
+    <div style="min-width:180px;">
+      <label class="muted">Human coded</label>
+      <select name="has_human">
+        <option value="" {% if not has_human %}selected{% endif %}>(any)</option>
+        <option value="1" {% if has_human == "1" %}selected{% endif %}>Yes</option>
+      </select>
+    </div>
+
+    <div style="min-width:200px;">
+      <label class="muted">Has annotations</label>
+      <select name="has_any_span">
+        <option value="" {% if not has_any_span %}selected{% endif %}>(any)</option>
+        <option value="1" {% if has_any_span == "1" %}selected{% endif %}>Yes</option>
+      </select>
+    </div>
+  </div>
+
+  <input type="hidden" name="rows" value="{{ rows }}">
+  <input type="hidden" name="start" value="{{ start }}">
+</form>
+
+<div class="meta">
+  <span class="pill">Results: {{ result.get("numFound", 0) }}</span>
+</div>
+
+<table class="table">
+  <thead>
+    <tr>
+      <th>ID</th>
+      <th>Title</th>
+      <th>Source</th>
+      <th>Published</th>
+      <th></th>
+      <th></th>
+    </tr>
+  </thead>
+
+  <tbody>
+    {% set docs = (result.get("docs") or []) %}
+    {% if docs|length == 0 %}
+      <tr>
+        <td colspan="6" class="muted">No results.</td>
+      </tr>
+    {% endif %}
+
+    {% for d in docs %}
+      {% set doc_id = d.get("document_id_s","") %}
+      {% set title = (d.get("title_txt") or [""])[0] %}
+
+      {% set _source = d.get("source_s") %}
+      {% if _source is iterable and _source is not string %}
+        {% set source = (_source[0] if _source|length > 0 else "") %}
+      {% else %}
+        {% set source = (_source or "") %}
+      {% endif %}
+
+      {% set _published = d.get("published_dt") %}
+      {% if _published is iterable and _published is not string %}
+        {% set published = (_published[0] if _published|length > 0 else "") %}
+      {% else %}
+        {% set published = (_published or "") %}
+      {% endif %}
+
+      <tr>
+        <td><span class="mono">{{ doc_id[:8] }}</span></td>
+
+        <td>
+          {% if title %}
+            {{ title }}
+          {% else %}
+            <span class="muted">(untitled)</span>
+          {% endif %}
+        </td>
+
+        <td>{{ source if source else "—" }}</td>
+        <td class="mono">{{ published if published else "—" }}</td>
+
+        <td>
+          <a class="btnlink" href="/ui/docs/{{ doc_id }}">Open</a>
+        </td>
+
+        <td>
+          <form method="post" action="/ui/projects/add_one">
+            <input type="hidden" name="document_id" value="{{ doc_id }}">
+            <button type="submit">Add to Project</button>
+          </form>
+        </td>
+      </tr>
+    {% endfor %}
+  </tbody>
+</table>
+
+<div class="row">
+  {% if start|int > 0 %}
+    <a class="btnlink"
+       href="/ui/search?kw={{ kw or '' }}&kw_field={{ kw_field or 'all' }}&include_codes_topics={{ include_codes_topics or '1' }}&q={{ q or '' }}&scope={{ scope }}&code={{ code or '' }}&topic={{ topic or '' }}&has_human={{ has_human or '' }}&has_any_span={{ has_any_span or '' }}&rows={{ rows }}&start={{ (start|int - rows|int) }}">
+      Prev
+    </a>
+  {% endif %}
+
+  {% set next_start = (start|int + rows|int) %}
+  {% set total = result.get("numFound", 0) %}
+  {% if next_start < (total|int) %}
+    <a class="btnlink"
+       href="/ui/search?kw={{ kw or '' }}&kw_field={{ kw_field or 'all' }}&include_codes_topics={{ include_codes_topics or '1' }}&q={{ q or '' }}&scope={{ scope }}&code={{ code or '' }}&topic={{ topic or '' }}&has_human={{ has_human or '' }}&has_any_span={{ has_any_span or '' }}&rows={{ rows }}&start={{ next_start }}">
+      Next
+    </a>
+  {% else %}
+    <span class="muted">End</span>
+  {% endif %}
+</div>
+
+{% endblock %}

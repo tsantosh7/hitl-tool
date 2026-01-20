@@ -1,0 +1,54 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Workspace</h1>
+
+<div class="card">
+  <h2>Select Project</h2>
+  <form method="post" action="/ui/select_project" class="row">
+    <select name="project_id" class="grow" required>
+      <option value="" disabled {% if not selected_project_id %}selected{% endif %}>Choose a project…</option>
+      {% for p in projects %}
+        <option value="{{ p.project_id }}" {% if p.project_id == selected_project_id %}selected{% endif %}>
+          {{ p.name }} ({{ p.project_id }})
+        </option>
+      {% endfor %}
+    </select>
+    <button type="submit">Use Project</button>
+  </form>
+
+  {% if selected_project_name %}
+    <div class="meta">
+      <span class="pill">Active: {{ selected_project_name }}</span>
+    </div>
+  {% endif %}
+</div>
+
+{% if user.role in ["admin", "reviewer"] %}
+<div class="card">
+  <h2>Create Project</h2>
+  <form method="post" action="/ui/projects/create">
+    <div class="row">
+      <input class="grow" name="name" placeholder="Project name" required>
+      <button type="submit">Create</button>
+    </div>
+    <div class="row">
+      <input class="grow" name="team_name" value="Default Team" placeholder="Team name (optional)">
+    </div>
+  </form>
+</div>
+{% endif %}
+
+
+
+<div class="grid">
+  <a class="bigbtn" href="/ui/search">Search Documents</a>
+  <a class="bigbtn" href="/ui/add_to_project">Add to Project</a>
+  <a class="bigbtn" href="/ui/export">Extract Coded Data</a>
+  <a class="bigbtn" href="/ui/codes">Add Codes</a>
+</div>
+
+
+<div class="muted" style="margin-top:12px;">
+  Workflow: Select a project → Search → Open a document → Annotate in Hypothesis → Review HITL topics.
+</div>
+{% endblock %}

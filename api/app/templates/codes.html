@@ -1,0 +1,77 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Add Codes</h1>
+
+<div class="row">
+  <a class="btnlink" href="/ui/codes{% if include_inactive %}{% else %}?include_inactive=1{% endif %}">
+    {% if include_inactive %}Hide inactive{% else %}Show inactive{% endif %}
+  </a>
+</div>
+
+{% if message %}
+  <div class="alert">{{ message }}</div>
+{% endif %}
+
+{% if user.role == "admin" %}
+<div class="card">
+  <h2>Create Extension Code</h2>
+  <form method="post" action="/ui/codes/create">
+    <div class="row">
+      <input class="grow" name="code" placeholder="code key (will normalize)" required>
+      <input class="grow" name="display_name" placeholder="display name (optional)">
+    </div>
+    <div class="row">
+      <input class="grow" name="description" placeholder="description (optional)">
+      <button type="submit">Create</button>
+    </div>
+  </form>
+</div>
+{% endif %}
+
+<table class="table">
+  <thead>
+    <tr>
+      <th>Code</th>
+      <th>Version</th>
+      <th>Locked</th>
+      <th>Active</th>
+      <th>Aliases</th>
+      {% if user.role == "admin" %}<th>Actions</th>{% endif %}
+    </tr>
+  </thead>
+  <tbody>
+  {% for c in codes %}
+    <tr>
+      <td><strong>{{ c.code }}</strong></td>
+      <td><span class="pill">{{ c.version }}</span></td>
+      <td>{{ "Yes" if c.is_locked else "No" }}</td>
+      <td>{{ "Yes" if c.is_active else "No" }}</td>
+      <td class="mono">
+        {% if c.aliases and c.aliases|length > 0 %}
+          {{ c.aliases|join(", ") }}
+        {% else %}
+          <span class="muted">—</span>
+        {% endif %}
+      </td>
+
+      {% if user.role == "admin" %}
+      <td class="actions">
+        <form method="post" action="/ui/codes/add_alias">
+          <input type="hidden" name="code" value="{{ c.code }}">
+          <input name="alias" placeholder="new alias" required>
+          <button type="submit">Add alias</button>
+        </form>
+
+        {% if (not c.is_locked) and c.is_active %}
+        <form method="post" action="/ui/codes/deactivate">
+          <input type="hidden" name="code" value="{{ c.code }}">
+          <button class="danger" type="submit">Deactivate</button>
+        </form>
+        {% endif %}
+      </td>
+      {% endif %}
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endblock %}

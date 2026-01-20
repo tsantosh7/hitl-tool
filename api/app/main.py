@@ -1,103 +1,117 @@
 # api/app/main.py
+from __future__ import annotations
+
 import os
-import json
-import random
 import re
-import requests
+import io
+import csv
+import json
+import uuid
+import queue
+import random
+import logging
+import threading
 import urllib.parse
-from datetime import datetime, date
+
+from datetime import datetime, date, timezone
 from typing import Any, Dict, List, Optional, Iterable, Tuple
-from uuid import uuid4
-import urllib.parse
 
+import requests
+from requests.exceptions import RequestException
+from requests.adapters import HTTPAdapter
 
-from pydantic import BaseModel, Field
+from urllib3.util.retry import Retry
+
+from uuid import UUID, uuid4
+
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import StreamingResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
+from starlette.middleware.sessions import SessionMiddleware
+
 from pydantic import BaseModel, Field, HttpUrl
-from sqlalchemy import select
 
-import queue
-import threading
-
-from datetime import timezone
-import uuid
-
-from sqlalchemy import func
+from sqlalchemy import select, func
 
 
-import csv
-import io
+
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import StreamingResponse
-from sqlalchemy import func
-
-
-import urllib.parse
-
-from pydantic import BaseModel, Field
-
-
+from starlette.middleware.sessions import SessionMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
 
 from .db import SessionLocal
 from .init_db import init
 from .models import (
     Team, Project, Document, ProjectDocument,
     HypothesisGroup, HypothesisAnnotation,
-    Code, CodeAlias, ProjectDocumentReview, TopicRun, DocumentTopic
+    Code, CodeAlias, ProjectDocumentReview, TopicRun, DocumentTopic, DocEmbedding,
 )
 
-from uuid import UUID
-from sqlalchemy import select
-from .models import TopicRun, DocumentTopic
-from .models import DocEmbedding
-
-import requests
-from requests.adapters import HTTPAdapter
-from requests.exceptions import RequestException
-from urllib3.util.retry import Retry
-
-
-
-from typing import Optional, Tuple, List, Dict, Any
-
-from pydantic import BaseModel, Field
-from uuid import UUID
-import random
-
-from fastapi import Query
-
-import logging
 logger = logging.getLogger(__name__)
 
+# ------------------------------------------------------------------------------
+# App instance MUST be created before mount/include/middleware
+# ------------------------------------------------------------------------------
+app = FastAPI()
 
-import time, random
-import requests
-from requests import Response
-from requests.exceptions import ConnectionError, ReadTimeout, ChunkedEncodingError
+# ------------------------------------------------------------------------------
+# Session middleware (configure via env)
+# ------------------------------------------------------------------------------
+SESSION_SECRET = os.environ.get("SESSION_SECRET", "dev-secret-change-me")
+COOKIE_SECURE = os.environ.get("COOKIE_SECURE", "0") == "1"
 
+app.add_middleware(
+    SessionMiddleware,
+    secret_key=SESSION_SECRET,
+    https_only=COOKIE_SECURE,
+    same_site="lax",
+)
+
+# ------------------------------------------------------------------------------
+# Static + Templates (mount ONCE)
+# ------------------------------------------------------------------------------
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+# If your folders are api/app/static and api/app/templates
+STATIC_DIR = os.path.join(BASE_DIR, "static")
+TEMPLATES_DIR = os.path.join(BASE_DIR, "templates")
+
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+app.state.templates = Jinja2Templates(directory=TEMPLATES_DIR)
+
+# ------------------------------------------------------------------------------
+# Routers (include ONCE)
+# ------------------------------------------------------------------------------
+from app.auth.routes import router as auth_router
+from app.ui.routes import router as ui_router
+
+app.include_router(auth_router)
+app.include_router(ui_router)
+
+# ------------------------------------------------------------------------------
+# Env / constants
+# ------------------------------------------------------------------------------
 RETRYABLE_STATUS = {429, 500, 502, 503, 504}
+
 SOLR_BASE_URL = os.getenv("SOLR_BASE_URL", "").strip()
 HYPOTHESIS_API_TOKEN = os.getenv("HYPOTHESIS_API_TOKEN", "").strip()
+
 DATA_DIR = os.getenv("DATA_DIR", "").strip() or os.path.join(os.getcwd(), "data")
 HYPOTHESIS_SNAPSHOT_DIR = os.path.join(DATA_DIR, "hypothesis")
 HYPOTHESIS_API_BASE = "https://api.hypothes.is/api"
 
 # Global-core model: projects point to one shared Solr core
 SOLR_GLOBAL_CORE = os.getenv("SOLR_GLOBAL_CORE", "hitl_test").strip() or "hitl_test"
-# _SOLR_FQ_NEEDS_QUOTES = re.compile(r"""[ :\[\]\(\)\{\}"'\\]""")  # includes colon + common specials
-_SOLR_NEEDS_QUOTES = re.compile(r"""[\s:\[\]\(\)\{\}"'\\]""")  # whitespace, colon, etc.
 
-# ------------------------------------------------------------------------------
+# Solr quoting helper
+_SOLR_NEEDS_QUOTES = re.compile(r"""[\s:\[\]\(\)\{\}"'\\]""")
 
 # Hypothesis public group safety (NEVER sync __world__ unless explicitly requested)
-# ------------------------------------------------------------------------------
 HYPOTHESIS_PUBLIC_GROUP_ID = "__world__"
 HYPOTHESIS_EXCLUDE_PUBLIC = os.getenv("HYPOTHESIS_EXCLUDE_PUBLIC", "true").lower() == "true"
 
-
-
-
-app = FastAPI()
 
 
 
@@ -125,6 +139,7 @@ def health():
         "hypothesis_snapshot_dir": HYPOTHESIS_SNAPSHOT_DIR,
         "has_hypothesis_token": bool(HYPOTHESIS_API_TOKEN),
     }
+
 
 
 # -----------------------------
@@ -233,9 +248,15 @@ def normalize_url(u: Optional[str]) -> Optional[str]:
         return u.split("#", 1)[0]
 
 
+# def solr_core_url(core: str) -> str:
+#     _require_solr()
+#     return f"{SOLR_BASE_URL.rstrip('/')}/{core}"
 def solr_core_url(core: str) -> str:
     _require_solr()
-    return f"{SOLR_BASE_URL.rstrip('/')}/{core}"
+    base = SOLR_BASE_URL.rstrip("/")
+    if base.endswith("/solr"):
+        return f"{base}/{core}"
+    return f"{base}/solr/{core}"
 
 
 def utc_now_z() -> str:
@@ -813,6 +834,10 @@ def solr_escape_term(s: str) -> str:
     return re.sub(r'([+\-!(){}[\]^"~*?:\\/]|&&|\|\|)', r'\\\1', s)
 
 
+# def solr_escape_term(s: str) -> str:
+#     return re.sub(r'([+\-!(){}\[\]^"~*?:\\/]|&&|\|\|)', r'\\\1', s)
+
+
 def normalize_fq_list(fq):
     if fq is None:
         return []
@@ -1326,10 +1351,11 @@ def solr_commit(core: str):
 # Projects endpoints (Fix 2: global core model)
 # ------------------------------------------------------------------------------
 
-@app.post("/projects", response_model=CreateProjectOut)
-def create_project(payload: CreateProjectIn):
+@app.post("/projects/bootstrap", response_model=CreateProjectOut)
+def create_project_bootstrap(payload: CreateProjectIn):
     """
-    Global core model: projects do NOT create per-project Solr cores.
+    Global core model: projects do NOT create per-project Solr cores. changed the name
+    create_project_bootstrap from create_project as there is another function
     """
     db = SessionLocal()
     try:
@@ -3196,10 +3222,6 @@ class ReviewUpdateRequest(BaseModel):
     status: str  # unseen|in_progress|done|disputed
     updated_by: Optional[str] = None
 
-from uuid import UUID
-from fastapi import HTTPException
-from sqlalchemy import select
-
 @app.post("/projects/{project_id}/review/status")
 def set_review_status(
     project_id: UUID,
@@ -3644,6 +3666,7 @@ def recompute_solr_topics(
 
 
 
+
 @app.get("/documents/{document_id}/topics")
 def get_document_topics(document_id: str, run_id: UUID):
     db = SessionLocal()
@@ -3658,12 +3681,17 @@ def get_document_topics(document_id: str, run_id: UUID):
                 DocumentTopic.topic_label,
                 DocumentTopic.score,
                 DocumentTopic.source,
+                DocumentTopic.assignment_type,
+                DocumentTopic.status,
                 DocumentTopic.evidence,
                 DocumentTopic.updated_at,
             )
             .where(DocumentTopic.run_id == run_id)
             .where(DocumentTopic.document_id == document_id)
-            .order_by(DocumentTopic.score.desc().nullslast(), DocumentTopic.topic_key.asc())
+            .order_by(
+                DocumentTopic.score.desc().nullslast(),
+                DocumentTopic.topic_key.asc(),
+            )
         ).all()
 
         return {
@@ -3676,14 +3704,56 @@ def get_document_topics(document_id: str, run_id: UUID):
                     "topic_label": lab,
                     "score": sc,
                     "source": src,
+                    "assignment_type": atype,
+                    "status": status,
                     "evidence": ev or {},
                     "updated_at": iso_z(u) if u else None,
                 }
-                for (k, lab, sc, src, ev, u) in rows
+                for (k, lab, sc, src, atype, status, ev, u) in rows
             ],
         }
     finally:
         db.close()
+
+# def get_document_topics(document_id: str, run_id: UUID):
+#     db = SessionLocal()
+#     try:
+#         run = db.get(TopicRun, run_id)
+#         if not run:
+#             raise HTTPException(404, "topic run not found")
+#
+#         rows = db.execute(
+#             select(
+#                 DocumentTopic.topic_key,
+#                 DocumentTopic.topic_label,
+#                 DocumentTopic.score,
+#                 DocumentTopic.source,
+#                 DocumentTopic.evidence,
+#                 DocumentTopic.updated_at,
+#             )
+#             .where(DocumentTopic.run_id == run_id)
+#             .where(DocumentTopic.document_id == document_id)
+#             .order_by(DocumentTopic.score.desc().nullslast(), DocumentTopic.topic_key.asc())
+#         ).all()
+#
+#         return {
+#             "ok": True,
+#             "run_id": str(run_id),
+#             "document_id": document_id,
+#             "topics": [
+#                 {
+#                     "topic_key": k,
+#                     "topic_label": lab,
+#                     "score": sc,
+#                     "source": src,
+#                     "evidence": ev or {},
+#                     "updated_at": iso_z(u) if u else None,
+#                 }
+#                 for (k, lab, sc, src, ev, u) in rows
+#             ],
+#         }
+#     finally:
+#         db.close()
 
 
 ################################ HITL topics modelling #########
@@ -4060,6 +4130,11 @@ def topic_human_delete(payload: TopicHumanDeleteIn, core: str = SOLR_GLOBAL_CORE
         return {"ok": True, "human_deleted": True, "propagation": prop}
     finally:
         db.close()
+
+@app.post("/topics/label/delete")
+def topics_label_delete_alias(payload: TopicHumanDeleteIn):
+    return topic_human_delete(payload)
+
 
 # G3) Suggestions-only endpoint (for UI preview)
 # Does not write anything.

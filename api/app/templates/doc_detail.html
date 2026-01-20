@@ -1,0 +1,203 @@
+{% extends "base.html" %}
+{% block content %}
+
+{# ---------- Helpers: handle Solr fields that can be str OR list ---------- #}
+{% set doc_id = doc.get("document_id_s") or "" %}
+
+{% set _title = doc.get("title_txt") %}
+{% if _title is iterable and _title is not string %}
+  {% set title = (_title[0] if _title|length > 0 else "") %}
+{% else %}
+  {% set title = (_title or "") %}
+{% endif %}
+
+{% set _excerpt = doc.get("excerpt_txt") %}
+{% if _excerpt is iterable and _excerpt is not string %}
+  {% set excerpt = (_excerpt[0] if _excerpt|length > 0 else "") %}
+{% else %}
+  {% set excerpt = (_excerpt or "") %}
+{% endif %}
+
+{% set _source = doc.get("source_s") %}
+{% if _source is iterable and _source is not string %}
+  {% set source = (_source[0] if _source|length > 0 else "") %}
+{% else %}
+  {% set source = (_source or "") %}
+{% endif %}
+
+{% set _dtype = doc.get("doc_type_s") %}
+{% if _dtype is iterable and _dtype is not string %}
+  {% set doc_type = (_dtype[0] if _dtype|length > 0 else "") %}
+{% else %}
+  {% set doc_type = (_dtype or "") %}
+{% endif %}
+
+{% set _published = doc.get("published_dt") %}
+{% if _published is iterable and _published is not string %}
+  {% set published = (_published[0] if _published|length > 0 else "") %}
+{% else %}
+  {% set published = (_published or "") %}
+{% endif %}
+
+{% set _url = doc.get("canonical_url_s") %}
+{% if _url is iterable and _url is not string %}
+  {% set canonical_url = (_url[0] if _url|length > 0 else "") %}
+{% else %}
+  {% set canonical_url = (_url or "") %}
+{% endif %}
+
+{# Prefer direct hypothesis link if available #}
+{% set hypo_link = "" %}
+{% if hypo and hypo.get("hypothesis_direct") %}
+  {% set hypo_link = hypo.get("hypothesis_direct") %}
+{% elif hypo and hypo.get("hypothesis_incontext") %}
+  {% set hypo_link = hypo.get("hypothesis_incontext") %}
+{% endif %}
+
+<div class="row" style="align-items:center; justify-content:space-between;">
+  <div>
+    <h1 class="mono" style="margin-bottom:4px;">{{ doc_id[:8] }}</h1>
+    <div class="muted" style="font-size: 12px;">
+      Document ID hidden (shows first 8 chars).&nbsp;
+      <button type="button" onclick="navigator.clipboard.writeText('{{ doc_id }}')" style="border:0; background:none; padding:0; cursor:pointer; text-decoration:underline;">
+        Copy full ID
+      </button>
+    </div>
+  </div>
+
+  <div class="row" style="gap:10px;">
+    {% if canonical_url %}
+      <a class="btnlink" href="{{ canonical_url }}" target="_blank" rel="noopener">Open original</a>
+    {% else %}
+      <span class="muted">No canonical URL</span>
+    {% endif %}
+
+    {% if hypo_link %}
+      <a class="btnlink" href="{{ hypo_link }}" target="_blank" rel="noopener">Open in Hypothesis</a>
+    {% else %}
+      <span class="muted">Hypothesis link unavailable</span>
+    {% endif %}
+
+    {# Optional: if you pass back_url from router, use it; else fall back to /ui/search #}
+    <a class="btnlink" href="{{ back_url if back_url else '/ui/search' }}">Back to Search</a>
+  </div>
+</div>
+
+<h2 style="margin-top:10px;">
+  {{ title if title else "(no title)" }}
+</h2>
+
+<div class="meta">
+  {% if source %}<span class="pill">source: {{ source }}</span>{% endif %}
+  {% if doc_type %}<span class="pill">type: {{ doc_type }}</span>{% endif %}
+  {% if published %}<span class="pill">published: <span class="mono">{{ published }}</span></span>{% endif %}
+  {% if canonical_url %}<span class="pill">has url</span>{% endif %}
+</div>
+
+{% if excerpt %}
+  <div class="card">
+    <h3>Excerpt</h3>
+    <p>{{ excerpt }}</p>
+  </div>
+{% endif %}
+
+<div class="card">
+  <h3>Topics (HITL)</h3>
+
+  {% if user.role in ["admin", "reviewer"] %}
+    <div style="margin: 10px 0 14px 0;">
+      <form method="post" action="/ui/topics/accept" class="row" style="gap:10px; align-items:end;">
+        <input type="hidden" name="document_id" value="{{ doc_id }}">
+        <input type="hidden" name="run_id" value="{{ run_id }}">
+
+        <div class="grow">
+          <label class="muted">Topic label</label>
+          <input class="grow" name="topic_label" placeholder="e.g., Sentencing" required>
+        </div>
+
+        <div style="width:180px;">
+          <label class="muted">Topic key</label>
+          <input name="topic_key" placeholder="e.g., T01" required>
+        </div>
+
+        <button type="submit">Add Topic</button>
+      </form>
+    </div>
+  {% endif %}
+
+  {% if not topics or topics|length == 0 %}
+    <div class="muted">No topics found for this document.</div>
+  {% else %}
+    <table class="table">
+      <thead>
+        <tr>
+          <th>Topic</th>
+          <th>Key</th>
+          <th>Score</th>
+          <th>Source</th>
+          <th>Status</th>
+          <th>Updated</th>
+          <th>Actions</th>
+        </tr>
+      </thead>
+
+      <tbody>
+      {% for t in topics %}
+        {% set src = t.get("source") if t is mapping else t.source %}
+        {% set lbl = t.get("topic_label") if t is mapping else t.topic_label %}
+        {% set key = t.get("topic_key") if t is mapping else t.topic_key %}
+        {% set sc  = t.get("score") if t is mapping else t.score %}
+        {% set upd = t.get("updated_at") if t is mapping else t.updated_at %}
+        {% set at  = (t.get("assignment_type") if t is mapping else t.assignment_type) %}
+        {% set st  = (t.get("status") if t is mapping else t.status) %}
+
+        <tr>
+          <td><strong>{{ lbl }}</strong></td>
+          <td class="mono">{{ key }}</td>
+          <td class="mono">{{ "%.2f"|format(sc or 0) }}</td>
+          <td><span class="pill">{{ src }}</span></td>
+          <td class="mono">{{ (st or "") }}</td>
+          <td class="mono">{{ upd or "" }}</td>
+
+          <td class="actions">
+            {# Accept/Reject for ACTIVE suggestions that are not already human #}
+            {% if user.role in ["admin", "reviewer"] and (st != "deleted" and st != "rejected") and (at != "human") %}
+              <form method="post" action="/ui/topics/accept">
+                <input type="hidden" name="document_id" value="{{ doc_id }}">
+                <input type="hidden" name="topic_key" value="{{ key }}">
+                <input type="hidden" name="topic_label" value="{{ lbl }}">
+                <input type="hidden" name="run_id" value="{{ run_id }}">
+                <button class="ok" type="submit">Accept</button>
+              </form>
+
+              <form method="post" action="/ui/topics/reject">
+                <input type="hidden" name="document_id" value="{{ doc_id }}">
+                <input type="hidden" name="topic_key" value="{{ key }}">
+                <input type="hidden" name="run_id" value="{{ run_id }}">
+                <button class="danger" type="submit">Reject</button>
+              </form>
+            {% endif %}
+
+            {# Remove only for ACTIVE human labels #}
+            {% if user.role in ["admin", "reviewer"] and at == "human" and st == "active" %}
+              <form method="post" action="/ui/topics/delete">
+                <input type="hidden" name="document_id" value="{{ doc_id }}">
+                <input type="hidden" name="topic_key" value="{{ key }}">
+                <input type="hidden" name="run_id" value="{{ run_id }}">
+                <button class="warn" type="submit">Remove</button>
+              </form>
+            {% endif %}
+
+            {% if st in ["deleted", "rejected"] %}
+              <span class="muted">({{ st }})</span>
+            {% endif %}
+          </td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  {% endif %}
+</div>
+
+
+{% endblock %}

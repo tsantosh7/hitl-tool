@@ -1,0 +1,28 @@
+<!doctype html>
+<html>
+<head>
+  <title>Login - HITL</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body class="centered">
+  <div class="card">
+    <h1>HITL Login</h1>
+
+    {% if error %}
+      <div class="alert">{{ error }}</div>
+    {% endif %}
+
+    <form method="post" action="/auth/login">
+      <label>Username</label>
+      <input name="username" autocomplete="username" required>
+
+      <label>Password</label>
+      <input name="password" type="password" autocomplete="current-password" required>
+
+      <button type="submit">Sign in</button>
+    </form>
+
+    <p class="muted">Demo users: admin/admin, reviewer/reviewer, viewer/viewer</p>
+  </div>
+</body>
+</html>

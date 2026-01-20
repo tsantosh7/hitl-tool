@@ -1,0 +1,45 @@
+<!doctype html>
+<html>
+<head>
+  <title>{{ title or "HITL" }}</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  {# Read project name from session if not explicitly passed #}
+  {% set _pn = project_name if project_name else (request.session.get("project_name") if request and request.session else None) %}
+  {% set _path = (request.url.path if request and request.url else "") %}
+
+  <header class="topbar">
+    <div class="brand">
+      <a href="/ui/dashboard" class="brandlink">HITL</a>
+    </div>
+
+    <nav class="nav">
+      <a href="/ui/search" class="{% if _path.startswith('/ui/search') %}active{% endif %}">Search Documents</a>
+      <a href="/ui/add_to_project" class="{% if _path.startswith('/ui/add_to_project') %}active{% endif %}">Add to Project</a>
+      <a href="/ui/export" class="{% if _path.startswith('/ui/export') %}active{% endif %}">Extract Coded Data</a>
+      <a href="/ui/codes" class="{% if _path.startswith('/ui/codes') %}active{% endif %}">Add Codes</a>
+    </nav>
+
+    <div class="right">
+      {% if _pn %}
+        <span class="pill">Project: {{ _pn }}</span>
+      {% else %}
+        <span class="pill muted">No project selected</span>
+      {% endif %}
+
+      <span class="pill">
+        {{ user.username if user and user.username else "user" }}
+        ·
+        {{ user.role if user and user.role else "" }}
+      </span>
+
+      <a class="btnlink" href="/auth/logout">Logout</a>
+    </div>
+  </header>
+
+  <main class="container">
+    {% block content %}{% endblock %}
+  </main>
+</body>
+</html>

@@ -32,9 +32,10 @@ services:
     command: >
       bash -lc "chown -R solr:solr /var/solr && su -s /bin/bash solr -c '/opt/solr/bin/solr -f'"
 
-
   api:
-    build: ./api
+    build:
+      context: ./api
+      network: host
     network_mode: "host"
     environment:
       DATABASE_URL: postgresql+psycopg://corpus:corpuspass@localhost:5432/corpusdb
