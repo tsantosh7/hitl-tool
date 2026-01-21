@@ -127,7 +127,7 @@
     <tr>
       <th>ID</th>
       <th>Title</th>
-      <th>Source</th>
+<!--      <th>Source</th>-->
       <th>Published</th>
       <th></th>
       <th></th>
@@ -146,7 +146,7 @@
       {% set doc_id = d.get("document_id_s","") %}
       {% set title = (d.get("title_txt") or [""])[0] %}
 
-      {% set _source = d.get("source_s") %}
+<!--      {% set _source = d.get("source_s") %}-->
       {% if _source is iterable and _source is not string %}
         {% set source = (_source[0] if _source|length > 0 else "") %}
       {% else %}

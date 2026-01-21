@@ -5,11 +5,32 @@ from fastapi import APIRouter, Request, Depends, Form
 from fastapi.responses import HTMLResponse, RedirectResponse
 import httpx
 import urllib.parse
-
+from fastapi import HTTPException
+from sqlalchemy import select
+from uuid import UUID
 from app.auth.deps import require_user, require_role
+from typing import Optional
+from uuid import UUID
+from sqlalchemy import select
+from app.models import TopicRun
+from app.db import SessionLocal
+
+import logging
+logger = logging.getLogger(__name__)
+
+from app.db import SessionLocal
+
+
+from sqlalchemy import select
+from uuid import UUID
+from app.models import TopicRun
+
+from app.topics.service import get_or_create_active_global_run
+
+from collections import defaultdict
+from typing import Dict, List, Any, Optional, Tuple
 
 router = APIRouter(prefix="/ui", tags=["ui"])
-
 
 # -------------------------
 # Internal ASGI calls to your API endpoints (no network hop)
@@ -22,15 +43,26 @@ async def asgi_get(request: Request, path: str, params: dict | None = None):
         return r.json()
 
 
-async def asgi_post_json(request: Request, path: str, json_body: dict):
+# async def asgi_post_json(request: Request, url: str, payload: dict):
+#     async with httpx.AsyncClient() as client:
+#         r = await client.post(url, json=payload, timeout=60)
+#
+#     if r.status_code == 422:
+#         logger.error("422 from %s payload=%s resp=%s", url, payload, r.text)
+#
+#     r.raise_for_status()
+#     return r.json() if r.content else None
+
+async def asgi_post_json(request: Request, path: str, payload: dict):
     transport = httpx.ASGITransport(app=request.app)
     async with httpx.AsyncClient(transport=transport, base_url="http://app") as client:
-        r = await client.post(path, json=json_body)
-        r.raise_for_status()
-        if r.headers.get("content-type", "").startswith("application/json"):
-            return r.json()
-        return {"ok": True}
+        r = await client.post(path, json=payload, timeout=60)
 
+    if r.status_code == 422:
+        logger.error("422 from %s payload=%s resp=%s", path, payload, r.text)
+
+    r.raise_for_status()
+    return r.json() if r.content else None
 
 async def asgi_patch(request: Request, path: str):
     transport = httpx.ASGITransport(app=request.app)
@@ -538,6 +570,14 @@ async def ui_doc_detail(request: Request, document_id: str, user=Depends(require
             "core": "hitl_test",
             "rows": 1,
             "start": 0,
+            "fl": ",".join([
+                "document_id_s", "canonical_url_s", "title_txt", "excerpt_txt", "published_dt", "doc_type_s",
+                "source_s",
+                "has_human_b", "has_model_b",
+                "codes_present_human_ss", "codes_present_model_ss",
+                "code_value_human_kv_ss", "code_value_human_norm_kv_ss",
+                "code_value_model_kv_ss", "code_value_model_norm_kv_ss",
+            ]),
         },
     )
 
@@ -562,7 +602,16 @@ async def ui_doc_detail(request: Request, document_id: str, user=Depends(require
 
     run_id = _get_run_id(request)
     if not run_id:
-        run_id = await _pick_run_id_for_project(request, project_id)
+        # run_id = await _pick_run_id_for_project(request, project_id)
+        run_id = _get_run_id(request)
+        if not run_id:
+            db = SessionLocal()
+            try:
+                run_id = _get_active_topic_run_id(db, project_id=None)
+            finally:
+                db.close()
+            _set_run_id(request, run_id)
+
         _set_run_id(request, run_id)
 
     topics: list[dict] = []
@@ -574,6 +623,8 @@ async def ui_doc_detail(request: Request, document_id: str, user=Depends(require
         )
         topics = topics_res.get("topics", []) or []
 
+    # --- build codes view for UI ---
+    codes_view, code_stats = build_codes_view(doc)
     back_url = request.headers.get("referer") or "/ui/search"
 
     return request.app.state.templates.TemplateResponse(
@@ -589,6 +640,10 @@ async def ui_doc_detail(request: Request, document_id: str, user=Depends(require
             "topics": topics,
             "in_project": in_project,
             "back_url": back_url,
+
+            # ✅ add these
+            "codes_view": codes_view,
+            "code_stats": code_stats,
         },
     )
 
@@ -596,28 +651,98 @@ async def ui_doc_detail(request: Request, document_id: str, user=Depends(require
 # -------------------------
 # Topic actions (HTML forms)
 # -------------------------
+# @router.post("/topics/accept")
+# async def ui_topic_accept(
+#     request: Request,
+#     document_id: str = Form(...),
+#     topic_label: str = Form(...),
+#     run_id: str = Form(...),
+#     topic_key: str = Form(""),  # <-- optional
+#     user=Depends(require_role("admin", "reviewer")),
+# ):
+#     form = await request.form()
+#
+#     doc_id = (form.get("document_id") or "").strip()
+#     topic_label = (form.get("topic_label") or "").strip()
+#     topic_key = (form.get("topic_key") or "").strip() or None
+#     run_id = (form.get("run_id") or "").strip() or None
+#
+#     if not doc_id or not topic_label:
+#         raise HTTPException(400, "document_id and topic_label are required")
+#
+#     # ✅ if run_id missing, recover from DB (instead of sending blank -> 422)
+#     if not run_id:
+#         db = SessionLocal()
+#         try:
+#             # if you store current project in session, use it; otherwise pass None
+#             project_id = request.session.get("project_id")  # adjust to your session key
+#             run_id = _get_active_topic_run_id(db, project_id)
+#         finally:
+#             db.close()
+#
+#     if not run_id:
+#         run = get_or_create_active_global_run(db, actor=None)
+#         # raise HTTPException(
+#         #     400,
+#         #     "No active topic run. Create a run and activate it first (/topics/runs then /topics/runs/{run_id}/activate)."
+#         # )
+#
+#     payload = {
+#         "run_id": run_id,
+#         "document_id": doc_id,
+#         "topic_label": topic_label,
+#         "topic_key": topic_key,  # optional
+#         "user": request.session.get("username") or None,  # if you store it
+#     }
+#
+#     # await asgi_post_json(request, "http://localhost:8000/topics/label", payload)
+#     await asgi_post_json(request, "http://localhost:8000/topics/label", payload)
+
+
 @router.post("/topics/accept")
 async def ui_topic_accept(
     request: Request,
     document_id: str = Form(...),
-    topic_key: str = Form(...),
     topic_label: str = Form(...),
-    run_id: str = Form(...),
+    run_id: str = Form(""),          # <-- optional now
+    topic_key: str = Form(""),
     user=Depends(require_role("admin", "reviewer")),
 ):
-    await asgi_post_json(
-        request,
-        "/topics/label",
-        {
-            "run_id": run_id,
-            "document_id": document_id,
-            "topic_key": topic_key,
-            "topic_label": topic_label,
-            "user": user["username"],
-        },
-    )
-    return RedirectResponse(f"/ui/docs/{document_id}", status_code=303)
+    form = await request.form()
 
+    doc_id = (form.get("document_id") or "").strip()
+    topic_label = (form.get("topic_label") or "").strip()
+    topic_key = (form.get("topic_key") or "").strip() or None
+    run_id = (form.get("run_id") or "").strip() or None
+
+    if not doc_id or not topic_label:
+        raise HTTPException(400, "document_id and topic_label are required")
+
+    # Always resolve run_id from DB if missing (GLOBAL)
+    if not run_id:
+        db = SessionLocal()
+        try:
+            run_id = _get_active_topic_run_id(db, project_id=None)  # GLOBAL only
+            if not run_id:
+                run = get_or_create_active_global_run(db, actor=user.get("username"))
+                run_id = str(run.run_id)
+        finally:
+            db.close()
+
+    # persist in session so doc_detail uses it
+    _set_run_id(request, run_id)
+
+    payload = {
+        "run_id": run_id,
+        "document_id": doc_id,
+        "topic_label": topic_label,
+        "topic_key": topic_key,
+        "user": user.get("username"),
+    }
+
+    await asgi_post_json(request, "/topics/label", payload)
+
+    return RedirectResponse(f"/ui/docs/{doc_id}", status_code=303)
 
 @router.post("/topics/reject")
 async def ui_topic_reject(
@@ -684,3 +809,159 @@ async def ui_create_project(
         _set_run_id(request, None)
 
     return RedirectResponse("/ui/search", status_code=303)
+
+
+
+
+
+
+
+# add helper somewhere in ui/routes.py
+
+
+
+def _get_active_topic_run_id(db, project_id: Optional[str]) -> Optional[str]:
+    """
+    Resolve the active topic run ID.
+
+    Priority:
+      1) Active run for the current project (if project_id provided)
+      2) Active global run (project_id IS NULL)
+
+    Returns:
+      run_id as string, or None if no active run exists
+    """
+
+    base_q = select(TopicRun).where(TopicRun.is_active.is_(True))
+
+    # 1️⃣ Prefer project-scoped active run
+    if project_id:
+        try:
+            proj_uuid = UUID(project_id)
+            r = db.execute(
+                base_q.where(TopicRun.project_id == proj_uuid)
+            ).scalars().first()
+            if r:
+                return str(r.run_id)
+        except Exception:
+            # invalid UUID or DB issue → safely ignore and fall back
+            pass
+
+    # 2️⃣ Fallback: global active run
+    r = db.execute(
+        base_q.where(TopicRun.project_id.is_(None))
+    ).scalars().first()
+
+    return str(r.run_id) if r else None
+
+
+
+
+
+
+
+################code views#################
+
+from collections import defaultdict
+from typing import Any, Dict, List, Tuple
+
+def _kv_list_to_map(kv_list):
+    """
+    ["OffSex=he", "MitFactSent=foo", "MitFactSent=bar"] -> {"OffSex":[...], "MitFactSent":[...]}
+    """
+    out = {}
+    if not kv_list:
+        return out
+    if isinstance(kv_list, str):
+        kv_list = [kv_list]
+    for item in kv_list:
+        if not item or "=" not in item:
+            continue
+        k, v = item.split("=", 1)
+        k = (k or "").strip()
+        v = (v or "").strip()
+        if not k:
+            continue
+        out.setdefault(k, []).append(v)
+    return out
+
+
+def _normalize_list_field(x):
+    if x is None:
+        return []
+    if isinstance(x, list):
+        return x
+    return [x]
+
+
+def build_codes_view(doc: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
+    human_raw  = _kv_list_to_map(doc.get("code_value_human_kv_ss"))
+    human_norm = _kv_list_to_map(doc.get("code_value_human_norm_kv_ss"))
+    model_raw  = _kv_list_to_map(doc.get("code_value_model_kv_ss"))
+    model_norm = _kv_list_to_map(doc.get("code_value_model_norm_kv_ss"))
+
+    all_codes = set(human_raw) | set(human_norm) | set(model_raw) | set(model_norm)
+
+    rows: List[Dict[str, Any]] = []
+    disagree_count = 0
+
+    for code in sorted(all_codes):
+        hr = human_raw.get(code, [])
+        hn = human_norm.get(code, [])
+        mr = model_raw.get(code, [])
+        mn = model_norm.get(code, [])
+
+        has_human = bool(hr or hn)
+        has_model = bool(mr or mn)
+
+        # prefer normalized for disagree detection; fall back to raw
+        a = _norm_set(hn) if hn else _norm_set(hr)
+        b = _norm_set(mn) if mn else _norm_set(mr)
+        disagree = bool(has_human and has_model and a and b and a != b)
+        if disagree:
+            disagree_count += 1
+
+        # "best" value display: prefer human norm, then human raw, then model norm, then model raw
+        best = None
+        if hn:
+            best = hn[0]
+            src = "human"
+        elif hr:
+            best = hr[0]
+            src = "human"
+        elif mn:
+            best = mn[0]
+            src = "model"
+        elif mr:
+            best = mr[0]
+            src = "model"
+        else:
+            src = None
+
+        if has_human and has_model:
+            src = "both" if src else "both"
+
+        rows.append({
+            "code": code,
+            "has_human": has_human,
+            "has_model": has_model,
+            "human_raw": hr,
+            "human_norm": hn,
+            "model_raw": mr,
+            "model_norm": mn,
+            "best": best,
+            "source": src,
+            "disagree": disagree,
+        })
+
+    stats = {
+        "total": len(all_codes),
+        "human_present": sum(1 for r in rows if r["has_human"]),
+        "model_present": sum(1 for r in rows if r["has_model"]),
+        "human_only": sum(1 for r in rows if r["has_human"] and not r["has_model"]),
+        "model_only": sum(1 for r in rows if r["has_model"] and not r["has_human"]),
+        "both": sum(1 for r in rows if r["has_human"] and r["has_model"]),
+        "disagree": disagree_count,  # ✅ your template uses this
+    }
+    return rows, stats
+

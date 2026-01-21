@@ -59,7 +59,11 @@
     <h1 class="mono" style="margin-bottom:4px;">{{ doc_id[:8] }}</h1>
     <div class="muted" style="font-size: 12px;">
       Document ID hidden (shows first 8 chars).&nbsp;
-      <button type="button" onclick="navigator.clipboard.writeText('{{ doc_id }}')" style="border:0; background:none; padding:0; cursor:pointer; text-decoration:underline;">
+      <button
+        type="button"
+        onclick="navigator.clipboard.writeText('{{ doc_id }}')"
+        style="border:0; background:none; padding:0; cursor:pointer; text-decoration:underline; color:inherit;"
+      >
         Copy full ID
       </button>
     </div>
@@ -78,7 +82,6 @@
       <span class="muted">Hypothesis link unavailable</span>
     {% endif %}
 
-    {# Optional: if you pass back_url from router, use it; else fall back to /ui/search #}
     <a class="btnlink" href="{{ back_url if back_url else '/ui/search' }}">Back to Search</a>
   </div>
 </div>
@@ -103,23 +106,29 @@
 
 <div class="card">
   <h3>Topics (HITL)</h3>
-
+    {% if not run_id %}
+      <div class="muted" style="font-size:12px; margin: 6px 0 10px 0;">
+        No active topic run is set. Actions will try to use the active run automatically; if none exists, you’ll be prompted to create/activate one.
+      </div>
+    {% endif %}
+  {# ---------------- Manual add: label only (no topic_key) ---------------- #}
   {% if user.role in ["admin", "reviewer"] %}
-    <div style="margin: 10px 0 14px 0;">
+    <div class="card" style="margin: 10px 0 14px 0;">
+      <h4 style="margin:0 0 8px 0;">Add / Accept topic</h4>
+      <div class="muted" style="font-size:12px; margin-bottom:8px;">
+        Type a topic name (e.g., “Sentencing”, “Evidence”, “Appeal outcome”). The system will assign an internal key automatically.
+      </div>
+
       <form method="post" action="/ui/topics/accept" class="row" style="gap:10px; align-items:end;">
         <input type="hidden" name="document_id" value="{{ doc_id }}">
-        <input type="hidden" name="run_id" value="{{ run_id }}">
+        <input type="hidden" name="run_id" value="{{ run_id or '' }}">
 
         <div class="grow">
-          <label class="muted">Topic label</label>
+          <label class="muted">Topic name</label>
           <input class="grow" name="topic_label" placeholder="e.g., Sentencing" required>
         </div>
 
-        <div style="width:180px;">
-          <label class="muted">Topic key</label>
-          <input name="topic_key" placeholder="e.g., T01" required>
-        </div>
-
+        {# DO NOT send topic_key; backend will generate deterministically from label #}
         <button type="submit">Add Topic</button>
       </form>
     </div>
@@ -132,7 +141,6 @@
       <thead>
         <tr>
           <th>Topic</th>
-          <th>Key</th>
           <th>Score</th>
           <th>Source</th>
           <th>Status</th>
@@ -153,7 +161,6 @@
 
         <tr>
           <td><strong>{{ lbl }}</strong></td>
-          <td class="mono">{{ key }}</td>
           <td class="mono">{{ "%.2f"|format(sc or 0) }}</td>
           <td><span class="pill">{{ src }}</span></td>
           <td class="mono">{{ (st or "") }}</td>
@@ -162,34 +169,156 @@
           <td class="actions">
             {# Accept/Reject for ACTIVE suggestions that are not already human #}
             {% if user.role in ["admin", "reviewer"] and (st != "deleted" and st != "rejected") and (at != "human") %}
-              <form method="post" action="/ui/topics/accept">
-                <input type="hidden" name="document_id" value="{{ doc_id }}">
-                <input type="hidden" name="topic_key" value="{{ key }}">
-                <input type="hidden" name="topic_label" value="{{ lbl }}">
-                <input type="hidden" name="run_id" value="{{ run_id }}">
-                <button class="ok" type="submit">Accept</button>
-              </form>
+              <form method="post" action="/ui/topics/accept" class="row" style="gap:10px; align-items:end;">
+              <input type="hidden" name="document_id" value="{{ doc_id }}">
+              {# run_id omitted; backend will auto-resolve active run #}
+            
+              <div class="grow">
+                <label class="muted">Topic name</label>
+                <input class="grow" name="topic_label" placeholder="e.g., Sentencing" required>
+              </div>
 
-              <form method="post" action="/ui/topics/reject">
+              <button type="submit">Add Topic</button>
+            </form>
+
+
+              <form method="post" action="/ui/topics/reject" onsubmit="return confirm('Reject this suggested topic?');">
                 <input type="hidden" name="document_id" value="{{ doc_id }}">
                 <input type="hidden" name="topic_key" value="{{ key }}">
-                <input type="hidden" name="run_id" value="{{ run_id }}">
+                <input type="hidden" name="run_id" value="{{ run_id or '' }}">
                 <button class="danger" type="submit">Reject</button>
               </form>
             {% endif %}
 
             {# Remove only for ACTIVE human labels #}
             {% if user.role in ["admin", "reviewer"] and at == "human" and st == "active" %}
-              <form method="post" action="/ui/topics/delete">
+              <form method="post" action="/ui/topics/delete" onsubmit="return confirm('Remove this topic label from this document?');">
                 <input type="hidden" name="document_id" value="{{ doc_id }}">
                 <input type="hidden" name="topic_key" value="{{ key }}">
-                <input type="hidden" name="run_id" value="{{ run_id }}">
+                <input type="hidden" name="run_id" value="{{ run_id or '' }}">
                 <button class="warn" type="submit">Remove</button>
               </form>
             {% endif %}
 
             {% if st in ["deleted", "rejected"] %}
               <span class="muted">({{ st }})</span>
+            {% endif %}
+          </td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+
+    <div class="muted" style="font-size:12px; margin-top:10px;">
+      Tip: “Accept” converts a suggestion into a human topic label (so it propagates). “Reject” hides that suggestion.
+    </div>
+  {% endif %}
+</div>
+
+
+<div class="card">
+  <h3>Codes (Extracted Values)</h3>
+
+  <div class="meta">
+    <span class="pill">human-only: {{ code_stats.human_only }}</span>
+    <span class="pill">model-only: {{ code_stats.model_only }}</span>
+    <span class="pill">both: {{ code_stats.both }}</span>
+    <span class="pill">disagreements: {{ code_stats.disagree }}</span>
+  </div>
+
+  {% if not codes_view or codes_view|length == 0 %}
+    <div class="muted">No code values found for this document.</div>
+  {% else %}
+    <table class="table">
+      <thead>
+        <tr>
+          <th style="width:220px;">Code</th>
+          <th>Best value (prefers human normalized)</th>
+          <th style="width:120px;">Source</th>
+          <th style="width:140px;">Notes</th>
+        </tr>
+      </thead>
+
+      <tbody>
+      {% for r in codes_view %}
+        <tr>
+          <td class="mono"><strong>{{ r.code }}</strong></td>
+
+          <td>
+            {% if r.best %}
+              {{ r.best }}
+            {% else %}
+              <span class="muted">—</span>
+            {% endif %}
+
+            <div style="margin-top:6px;">
+              <details>
+                <summary class="muted" style="cursor:pointer;">Show details</summary>
+
+                <div style="margin-top:10px;">
+                  <div class="row" style="gap:12px; align-items:flex-start;">
+                    <div class="grow">
+                      <div class="muted" style="font-weight:600; margin-bottom:4px;">Human (normalized)</div>
+                      {% if r.human_norm and r.human_norm|length > 0 %}
+                        {% for v in r.human_norm %}
+                          <span class="pill">{{ v }}</span>
+                        {% endfor %}
+                      {% else %}
+                        <div class="muted">—</div>
+                      {% endif %}
+
+                      <div class="muted" style="font-weight:600; margin:10px 0 4px 0;">Human (raw)</div>
+                      {% if r.human_raw and r.human_raw|length > 0 %}
+                        {% for v in r.human_raw %}
+                          <span class="pill">{{ v }}</span>
+                        {% endfor %}
+                      {% else %}
+                        <div class="muted">—</div>
+                      {% endif %}
+                    </div>
+
+                    <div class="grow">
+                      <div class="muted" style="font-weight:600; margin-bottom:4px;">Model (normalized)</div>
+                      {% if r.model_norm and r.model_norm|length > 0 %}
+                        {% for v in r.model_norm %}
+                          <span class="pill">{{ v }}</span>
+                        {% endfor %}
+                      {% else %}
+                        <div class="muted">—</div>
+                      {% endif %}
+
+                      <div class="muted" style="font-weight:600; margin:10px 0 4px 0;">Model (raw)</div>
+                      {% if r.model_raw and r.model_raw|length > 0 %}
+                        {% for v in r.model_raw %}
+                          <span class="pill">{{ v }}</span>
+                        {% endfor %}
+                      {% else %}
+                        <div class="muted">—</div>
+                      {% endif %}
+                    </div>
+                  </div>
+                </div>
+              </details>
+            </div>
+          </td>
+
+          <td>
+            {% if r.source == "human" %}
+              <span class="pill">Human</span>
+            {% elif r.source == "model" %}
+              <span class="pill">Model</span>
+            {% elif r.source == "both" %}
+              <span class="pill">Both</span>
+            {% else %}
+              <span class="muted">—</span>
+            {% endif %}
+          </td>
+
+          <td>
+            {% if r.disagree %}
+              <span class="pill">⚠ disagree</span>
+            {% else %}
+              <span class="muted">—</span>
             {% endif %}
           </td>
         </tr>
