@@ -35,11 +35,59 @@ router = APIRouter(prefix="/ui", tags=["ui"])
 # -------------------------
 # Internal ASGI calls to your API endpoints (no network hop)
 # -------------------------
+# async def asgi_get(request: Request, path: str, params: dict | None = None):
+#     transport = httpx.ASGITransport(app=request.app)
+#     async with httpx.AsyncClient(transport=transport, base_url="http://app") as client:
+#         r = await client.get(path, params=params)
+#         r.raise_for_status()
+#         return r.json()
+
 async def asgi_get(request: Request, path: str, params: dict | None = None):
+    """
+    Internal ASGI call helper (UI -> API).
+
+    Fixes / improvements:
+    - Ensures list-valued params (e.g., fq=["a","b"], facet.field=["x","y"]) are encoded
+      as repeated query parameters, not as a Python list string.
+    - Avoids surprises when passing nested types.
+    - Adds a clearer error message on failures (includes URL + status + response snippet).
+    """
+    import httpx
+
+    def _flatten_params(p: dict | None) -> list[tuple[str, str]]:
+        if not p:
+            return []
+        out: list[tuple[str, str]] = []
+        for k, v in p.items():
+            if v is None:
+                continue
+            if isinstance(v, (list, tuple)):
+                for item in v:
+                    if item is None:
+                        continue
+                    out.append((str(k), str(item)))
+            else:
+                out.append((str(k), str(v)))
+        return out
+
     transport = httpx.ASGITransport(app=request.app)
     async with httpx.AsyncClient(transport=transport, base_url="http://app") as client:
-        r = await client.get(path, params=params)
-        r.raise_for_status()
+        flat = _flatten_params(params)
+        r = await client.get(path, params=flat)
+        try:
+            r.raise_for_status()
+        except httpx.HTTPStatusError as e:
+            # Surface response body (super useful for debugging)
+            snippet = ""
+            try:
+                snippet = (r.text or "")[:2000]
+            except Exception:
+                snippet = ""
+            raise httpx.HTTPStatusError(
+                message=f"ASGI GET failed: {r.status_code} {path} params={flat} body={snippet}",
+                request=e.request,
+                response=e.response,
+            ) from e
         return r.json()
 
 
@@ -162,13 +210,84 @@ def _solr_escape_query(s: str) -> str:
     return s
 
 
+# def build_user_friendly_q(kw: str | None, kw_field: str, include_codes_topics: bool) -> str:
+#     """
+#     User-friendly search:
+#       - title/excerpt/body full text
+#       - human/model extracted values (raw + normalized)
+#     Optional:
+#       - codes_all_ss, topics_ss, topic_keys_ss, topic_kv_ss
+#
+#     kw_field:
+#       all      -> broad search
+#       title    -> title only
+#       excerpt  -> excerpt only
+#       body     -> body only
+#       values   -> values_* only
+#       url      -> canonical_url_s exact
+#       id       -> document_id_s exact
+#     """
+#     kw = (kw or "").strip()
+#     if not kw:
+#         return "*:*"
+#
+#     if kw_field == "url":
+#         return f'canonical_url_s:"{_solr_escape_phrase(kw)}"'
+#     if kw_field == "id":
+#         return f'document_id_s:"{_solr_escape_phrase(kw)}"'
+#
+#     qtext = _solr_escape_query(kw)
+#
+#     # Text fields (edismax qf)
+#     qf_all = (
+#         "title_txt^4 "
+#         "excerpt_txt^2 "
+#         "body_txt "
+#         "values_human_txt "
+#         "values_model_txt "
+#         "values_human_norm_txt "
+#         "values_model_norm_txt"
+#     )
+#     qf_title = "title_txt^4"
+#     qf_excerpt = "excerpt_txt^2"
+#     qf_body = "body_txt"
+#     qf_values = "values_human_txt values_model_txt values_human_norm_txt values_model_norm_txt"
+#
+#     if kw_field == "title":
+#         qf = qf_title
+#     elif kw_field == "excerpt":
+#         qf = qf_excerpt
+#     elif kw_field == "body":
+#         qf = qf_body
+#     elif kw_field == "values":
+#         qf = qf_values
+#     else:
+#         qf = qf_all
+#
+#     base = f'{{!edismax qf="{qf}" pf="{qf_title}" mm=1}}{qtext}'
+#
+#     if include_codes_topics:
+#         p = _solr_escape_phrase(kw)
+#         extra = (
+#             f' OR codes_all_ss:"{p}"'
+#             f' OR topics_ss:"{p}"'
+#             f' OR topic_keys_ss:"{p}"'
+#             f' OR topic_kv_ss:"{p}"'
+#         )
+#         return f"({base}{extra})"
+#
+#     return base
+
 def build_user_friendly_q(kw: str | None, kw_field: str, include_codes_topics: bool) -> str:
     """
-    User-friendly search:
-      - title/excerpt/body full text
-      - human/model extracted values (raw + normalized)
-    Optional:
-      - codes_all_ss, topics_ss, topic_keys_ss, topic_kv_ss
+    User-friendly Solr query builder.
+
+    Goals:
+    - Never return a malformed query (esp. for special chars).
+    - If kw is empty -> match all (*:*).
+    - Support exact match for url/id fields.
+    - Broad keyword search uses edismax over your indexed text fields.
+    - Optional: also match codes/topics fields (works for both Solr single/multi-valued strings).
 
     kw_field:
       all      -> broad search
@@ -183,14 +302,16 @@ def build_user_friendly_q(kw: str | None, kw_field: str, include_codes_topics: b
     if not kw:
         return "*:*"
 
+    # Exact-match modes
     if kw_field == "url":
         return f'canonical_url_s:"{_solr_escape_phrase(kw)}"'
     if kw_field == "id":
         return f'document_id_s:"{_solr_escape_phrase(kw)}"'
 
+    # edismax keyword search
     qtext = _solr_escape_query(kw)
 
-    # Text fields (edismax qf)
+    # NOTE: Keep qf fields aligned with what your /search endpoint returns & schema supports.
     qf_all = (
         "title_txt^4 "
         "excerpt_txt^2 "
@@ -216,19 +337,36 @@ def build_user_friendly_q(kw: str | None, kw_field: str, include_codes_topics: b
     else:
         qf = qf_all
 
+    # pf kept tight (title boost)
     base = f'{{!edismax qf="{qf}" pf="{qf_title}" mm=1}}{qtext}'
 
-    if include_codes_topics:
-        p = _solr_escape_phrase(kw)
-        extra = (
-            f' OR codes_all_ss:"{p}"'
-            f' OR topics_ss:"{p}"'
-            f' OR topic_keys_ss:"{p}"'
-            f' OR topic_kv_ss:"{p}"'
-        )
-        return f"({base}{extra})"
+    if not include_codes_topics:
+        return base
 
-    return base
+    # Also match common code/topic representations.
+    # IMPORTANT: use quoted phrase matching for exact tokens like "T01" or "offence_single".
+    p = _solr_escape_phrase(kw)
+
+    # Some installations store topics in multiple fields; we try the common ones.
+    # If a field doesn't exist in schema, Solr typically ignores it *only if* you don't
+    # have "fail-on-undefined-field" behavior. If your Solr is strict, we can reduce this list.
+    extra_terms = [
+        f'codes_all_ss:"{p}"',
+        f'codes_present_human_ss:"{p}"',
+        f'codes_present_model_ss:"{p}"',
+
+        f'topics_ss:"{p}"',
+        f'topic_keys_ss:"{p}"',
+        f'topic_kv_ss:"{p}"',
+
+        # Sometimes people search by "T01=0.82" tokens
+        f'topic_kv_ss:"{p}"',
+    ]
+
+    extra = " OR ".join(extra_terms)
+
+    # Wrap to ensure correct precedence.
+    return f"({base} OR {extra})"
 
 
 # -------------------------
@@ -275,6 +413,91 @@ async def ui_select_project(
     return RedirectResponse("/ui/dashboard", status_code=303)
 
 
+# # -------------------------
+# # Search Documents
+# # -------------------------
+# @router.get("/search", response_class=HTMLResponse)
+# async def ui_search(
+#     request: Request,
+#     # Advanced Solr query (optional)
+#     q: str = "",
+#     # Friendly keyword search (recommended)
+#     kw: str | None = None,
+#     kw_field: str = "all",  # all | title | excerpt | body | values | url | id
+#     include_codes_topics: str | None = "1",  # checkbox; default ON
+#     rows: int = 20,
+#     start: int = 0,
+#     scope: str = "all",  # all | project
+#     code: str | None = None,
+#     topic: str | None = None,
+#     has_human: str | None = None,
+#     has_any_span: str | None = None,
+#     user=Depends(require_user),
+# ):
+#     project_id = _get_project_id(request)
+#     project_name = _get_project_name(request)
+#
+#     fq: list[str] = []
+#     if code:
+#         fq.append(f'codes_all_ss:"{_solr_escape_phrase(code)}"')
+#     if topic:
+#         fq.append(f'topics_ss:"{_solr_escape_phrase(topic)}"')
+#     if has_human == "1":
+#         fq.append("has_human_b:true")
+#     if has_any_span == "1":
+#         fq.append("has_any_span_b:true")
+#
+#     advanced_q = (q or "").strip()
+#     kw_clean = (kw or "").strip()
+#
+#     if advanced_q:
+#         effective_q = advanced_q
+#     else:
+#         effective_q = build_user_friendly_q(
+#             kw_clean,
+#             kw_field,
+#             include_codes_topics=(include_codes_topics == "1" or include_codes_topics is None),
+#         )
+#
+#     params = {
+#         "q": effective_q,
+#         "core": "hitl_test",
+#         "rows": rows,
+#         "start": start,
+#         "fq": fq,
+#     }
+#
+#     if scope == "project":
+#         if not project_id:
+#             return RedirectResponse("/ui/dashboard", status_code=303)
+#         params["project_id"] = project_id
+#
+#     result = await asgi_get(request, "/search", params=params)
+#     facets = result.get("facets", {}) or {}
+#
+#     return request.app.state.templates.TemplateResponse(
+#         "search.html",
+#         {
+#             "request": request,
+#             "user": user,
+#             "project_id": project_id,
+#             "project_name": project_name,
+#             "scope": scope,
+#             "q": advanced_q,
+#             "kw": kw_clean,
+#             "kw_field": kw_field,
+#             "include_codes_topics": include_codes_topics or "1",
+#             "rows": rows,
+#             "start": start,
+#             "code": code,
+#             "topic": topic,
+#             "has_human": has_human,
+#             "has_any_span": has_any_span,
+#             "result": result,
+#             "facets": facets,
+#         },
+#     )
+
 # -------------------------
 # Search Documents
 # -------------------------
@@ -294,8 +517,37 @@ async def ui_search(
     topic: str | None = None,
     has_human: str | None = None,
     has_any_span: str | None = None,
+    # NEW: allow explicit core selection
+    core: str | None = None,
     user=Depends(require_user),
 ):
+    """
+    UI search page.
+
+    Fixes:
+    - Avoid hardcoding Solr core ("hitl_test"). Uses:
+        1) ?core= query param (function arg)
+        2) request.query_params["core"]
+        3) session["core"]
+        4) env SOLR_GLOBAL_CORE
+        5) fallback "hitl_test"
+      and persists the chosen core to session.
+
+    - Always passes `core` into the template so links can preserve it.
+    """
+    import os  # keep self-contained
+
+    # --- determine Solr core (arg -> query -> session -> env -> default) ---
+    chosen_core = (
+        core
+        or request.query_params.get("core")
+        or request.session.get("core")
+        or os.getenv("SOLR_GLOBAL_CORE")
+        or "hitl_test"
+    )
+    chosen_core = (chosen_core or "hitl_test").strip() or "hitl_test"
+    request.session["core"] = chosen_core
+
     project_id = _get_project_id(request)
     project_name = _get_project_name(request)
 
@@ -321,9 +573,9 @@ async def ui_search(
             include_codes_topics=(include_codes_topics == "1" or include_codes_topics is None),
         )
 
-    params = {
+    params: dict = {
         "q": effective_q,
-        "core": "hitl_test",
+        "core": chosen_core,
         "rows": rows,
         "start": start,
         "fq": fq,
@@ -342,6 +594,7 @@ async def ui_search(
         {
             "request": request,
             "user": user,
+            "core": chosen_core,  # IMPORTANT: templates should preserve this
             "project_id": project_id,
             "project_name": project_name,
             "scope": scope,
@@ -359,7 +612,6 @@ async def ui_search(
             "facets": facets,
         },
     )
-
 
 # -------------------------
 # Add to Project (bulk + from search)
@@ -541,15 +793,143 @@ async def ui_codes_deactivate(
     return RedirectResponse("/ui/codes", status_code=303)
 
 
+# # -------------------------
+# # Document detail (Review)
+# # -------------------------
+# @router.get("/docs/{document_id}", response_class=HTMLResponse)
+# async def ui_doc_detail(request: Request, document_id: str, user=Depends(require_user)):
+#     project_id = await _ensure_project_selected(request)
+#     if not project_id:
+#         return RedirectResponse("/ui/dashboard", status_code=303)
+#
+#     in_project = False
+#     try:
+#         proj_res = await asgi_get(
+#             request,
+#             f"/projects/{project_id}/documents",
+#             params={"limit": 5000, "offset": 0},
+#         )
+#         ids = set(proj_res.get("document_ids", []) or [])
+#         in_project = document_id in ids
+#     except Exception:
+#         in_project = False
+#
+#     doc_res = await asgi_get(
+#         request,
+#         "/search",
+#         params={
+#             "q": f'document_id_s:"{_solr_escape_phrase(document_id)}"',
+#             "core": "hitl_test",
+#             "rows": 1,
+#             "start": 0,
+#             "fl": ",".join([
+#                 "document_id_s", "canonical_url_s", "title_txt", "excerpt_txt", "published_dt", "doc_type_s",
+#                 "source_s",
+#                 "has_human_b", "has_model_b",
+#                 "codes_present_human_ss", "codes_present_model_ss",
+#                 "code_value_human_kv_ss", "code_value_human_norm_kv_ss",
+#                 "code_value_model_kv_ss", "code_value_model_norm_kv_ss",
+#             ]),
+#         },
+#     )
+#
+#     docs = doc_res.get("docs", []) or []
+#     doc = docs[0] if docs else {"document_id_s": document_id, "title_txt": ["(not found in Solr)"]}
+#
+#     hypo = None
+#     try:
+#         hypo = await asgi_get(request, "/hypothesis/link", params={"document_id": document_id})
+#     except Exception:
+#         hypo = None
+#
+#     if not hypo:
+#         cu = doc.get("canonical_url_s")
+#         if isinstance(cu, list):
+#             cu = cu[0] if cu else None
+#         if isinstance(cu, str) and cu:
+#             hypo = {
+#                 "hypothesis_incontext": build_hypothesis_incontext(cu, "__world__"),
+#                 "hypothesis_direct": build_hypothesis_direct(cu, "__world__"),
+#             }
+#
+#     run_id = _get_run_id(request)
+#     if not run_id:
+#         # run_id = await _pick_run_id_for_project(request, project_id)
+#         run_id = _get_run_id(request)
+#         if not run_id:
+#             db = SessionLocal()
+#             try:
+#                 run_id = _get_active_topic_run_id(db, project_id=None)
+#             finally:
+#                 db.close()
+#             _set_run_id(request, run_id)
+#
+#         _set_run_id(request, run_id)
+#
+#     topics: list[dict] = []
+#     if run_id:
+#         topics_res = await asgi_get(
+#             request,
+#             f"/documents/{document_id}/topics",
+#             params={"run_id": run_id},
+#         )
+#         topics = topics_res.get("topics", []) or []
+#
+#     # --- build codes view for UI ---
+#     codes_view, code_stats = build_codes_view(doc)
+#     back_url = request.headers.get("referer") or "/ui/search"
+#
+#     return request.app.state.templates.TemplateResponse(
+#         "doc_detail.html",
+#         {
+#             "request": request,
+#             "user": user,
+#             "project_id": project_id,
+#             "project_name": _get_project_name(request),
+#             "doc": doc,
+#             "hypo": hypo,
+#             "run_id": run_id,
+#             "topics": topics,
+#             "in_project": in_project,
+#             "back_url": back_url,
+#
+#             # ✅ add these
+#             "codes_view": codes_view,
+#             "code_stats": code_stats,
+#         },
+#     )
+
 # -------------------------
 # Document detail (Review)
 # -------------------------
 @router.get("/docs/{document_id}", response_class=HTMLResponse)
 async def ui_doc_detail(request: Request, document_id: str, user=Depends(require_user)):
+    """
+    Document detail page.
+
+    Fixes:
+    - Avoid hardcoding Solr core ("hitl_test"). Uses:
+        1) ?core= query param
+        2) session["core"]
+        3) env SOLR_GLOBAL_CORE
+        4) fallback "hitl_test"
+      and persists the chosen core to session.
+
+    - Removes Hypothesis link logic entirely (user only wants to open canonical URL).
+    - Passes `core` into the template context so templates can preserve it in links.
+    """
+
+    # --- determine Solr core (query -> session -> env -> default) ---
+    core = (request.query_params.get("core") or request.session.get("core") or os.getenv("SOLR_GLOBAL_CORE") or "hitl_test").strip()
+    if not core:
+        core = "hitl_test"
+    request.session["core"] = core
+
     project_id = await _ensure_project_selected(request)
     if not project_id:
         return RedirectResponse("/ui/dashboard", status_code=303)
 
+    # --- check if doc is in current project ---
     in_project = False
     try:
         proj_res = await asgi_get(
@@ -562,58 +942,51 @@ async def ui_doc_detail(request: Request, document_id: str, user=Depends(require
     except Exception:
         in_project = False
 
+    # --- fetch document from Solr (by id) ---
     doc_res = await asgi_get(
         request,
         "/search",
         params={
             "q": f'document_id_s:"{_solr_escape_phrase(document_id)}"',
-            "core": "hitl_test",
+            "core": core,
             "rows": 1,
             "start": 0,
-            "fl": ",".join([
-                "document_id_s", "canonical_url_s", "title_txt", "excerpt_txt", "published_dt", "doc_type_s",
-                "source_s",
-                "has_human_b", "has_model_b",
-                "codes_present_human_ss", "codes_present_model_ss",
-                "code_value_human_kv_ss", "code_value_human_norm_kv_ss",
-                "code_value_model_kv_ss", "code_value_model_norm_kv_ss",
-            ]),
+            "fl": ",".join(
+                [
+                    "document_id_s",
+                    "canonical_url_s",
+                    "title_txt",
+                    "excerpt_txt",
+                    "published_dt",
+                    "doc_type_s",
+                    "source_s",
+                    "has_human_b",
+                    "has_model_b",
+                    "codes_present_human_ss",
+                    "codes_present_model_ss",
+                    "code_value_human_kv_ss",
+                    "code_value_human_norm_kv_ss",
+                    "code_value_model_kv_ss",
+                    "code_value_model_norm_kv_ss",
+                ]
+            ),
         },
     )
 
     docs = doc_res.get("docs", []) or []
     doc = docs[0] if docs else {"document_id_s": document_id, "title_txt": ["(not found in Solr)"]}
 
-    hypo = None
-    try:
-        hypo = await asgi_get(request, "/hypothesis/link", params={"document_id": document_id})
-    except Exception:
-        hypo = None
-
-    if not hypo:
-        cu = doc.get("canonical_url_s")
-        if isinstance(cu, list):
-            cu = cu[0] if cu else None
-        if isinstance(cu, str) and cu:
-            hypo = {
-                "hypothesis_incontext": build_hypothesis_incontext(cu, "__world__"),
-                "hypothesis_direct": build_hypothesis_direct(cu, "__world__"),
-            }
-
+    # --- resolve run_id (session -> active fallback) ---
     run_id = _get_run_id(request)
     if not run_id:
-        # run_id = await _pick_run_id_for_project(request, project_id)
-        run_id = _get_run_id(request)
-        if not run_id:
-            db = SessionLocal()
-            try:
-                run_id = _get_active_topic_run_id(db, project_id=None)
-            finally:
-                db.close()
-            _set_run_id(request, run_id)
-
+        db = SessionLocal()
+        try:
+            run_id = _get_active_topic_run_id(db, project_id=None)
+        finally:
+            db.close()
         _set_run_id(request, run_id)
 
+    # --- document topics ---
     topics: list[dict] = []
     if run_id:
         topics_res = await asgi_get(
@@ -623,9 +996,11 @@ async def ui_doc_detail(request: Request, document_id: str, user=Depends(require
         )
         topics = topics_res.get("topics", []) or []
 
-    # --- build codes view for UI ---
+    # --- codes UI view ---
     codes_view, code_stats = build_codes_view(doc)
-    back_url = request.headers.get("referer") or "/ui/search"
+
+    # Prefer explicit back_url param, else referer, else search (preserve core)
+    back_url = request.query_params.get("back_url") or request.headers.get("referer") or f"/ui/search?core={core}"
 
     return request.app.state.templates.TemplateResponse(
         "doc_detail.html",
@@ -634,18 +1009,17 @@ async def ui_doc_detail(request: Request, document_id: str, user=Depends(require
             "user": user,
             "project_id": project_id,
             "project_name": _get_project_name(request),
+            "core": core,  # IMPORTANT: preserve core in templates/links
             "doc": doc,
-            "hypo": hypo,
             "run_id": run_id,
             "topics": topics,
             "in_project": in_project,
             "back_url": back_url,
-
-            # ✅ add these
             "codes_view": codes_view,
             "code_stats": code_stats,
         },
     )
+
 
 
 # -------------------------
@@ -865,25 +1239,91 @@ def _get_active_topic_run_id(db, project_id: Optional[str]) -> Optional[str]:
 from collections import defaultdict
 from typing import Any, Dict, List, Tuple
 
-def _kv_list_to_map(kv_list):
+from typing import Any, Dict, List
+
+def _kv_list_to_map(kv_list: Any) -> Dict[str, List[str]]:
     """
-    ["OffSex=he", "MitFactSent=foo", "MitFactSent=bar"] -> {"OffSex":[...], "MitFactSent":[...]}
+    Convert various KV formats into:
+      {"OffSex": ["he"], "MitFactSent": ["foo", "bar"]}
+
+    Accepts:
+      - ["OffSex=he", "MitFactSent=foo", "MitFactSent=bar"]
+      - ["OffSex:he", ...]
+      - ["OffSex|he", ...]
+      - ["OffSex\the", ...]
+      - [{"code":"OffSex","value":"he"}, ...]
+      - [{"k":"OffSex","v":"he"}, ...]
     """
-    out = {}
-    if not kv_list:
+    out: Dict[str, List[str]] = {}
+
+    if kv_list is None:
         return out
+
+    # If Solr returns a single string, treat as one-item list
     if isinstance(kv_list, str):
-        kv_list = [kv_list]
-    for item in kv_list:
-        if not item or "=" not in item:
-            continue
-        k, v = item.split("=", 1)
+        items = [kv_list]
+    elif isinstance(kv_list, list):
+        items = kv_list
+    else:
+        # handle accidental dict (single KV)
+        items = [kv_list]
+
+    def _add(k: str, v: Any) -> None:
         k = (k or "").strip()
-        v = (v or "").strip()
         if not k:
+            return
+        if v is None:
+            return
+        v_str = str(v).strip()
+        if v_str == "":
+            return
+        out.setdefault(k, []).append(v_str)
+
+    # Supported separators in order of preference
+    seps = ["=", ":", "|", "\t"]
+
+    for item in items:
+        if item is None:
             continue
-        out.setdefault(k, []).append(v)
+
+        # dict-like item
+        if isinstance(item, dict):
+            k = (
+                item.get("code")
+                or item.get("key")
+                or item.get("k")
+                or item.get("name")
+            )
+            v = (
+                item.get("value")
+                or item.get("val")
+                or item.get("v")
+                or item.get("text")
+            )
+            if k is not None and v is not None:
+                _add(str(k), v)
+            continue
+
+        s = str(item).strip()
+        if not s:
+            continue
+
+        # find first matching separator
+        k = None
+        v = None
+        for sep in seps:
+            if sep in s:
+                k, v = s.split(sep, 1)
+                break
+
+        if k is None:
+            # not parseable as KV; skip
+            continue
+
+        _add(k, v)
+
     return out
+
 
 
 def _normalize_list_field(x):
@@ -894,16 +1334,48 @@ def _normalize_list_field(x):
     return [x]
 
 
-def build_codes_view(doc: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
-    human_raw  = _kv_list_to_map(doc.get("code_value_human_kv_ss"))
-    human_norm = _kv_list_to_map(doc.get("code_value_human_norm_kv_ss"))
-    model_raw  = _kv_list_to_map(doc.get("code_value_model_kv_ss"))
-    model_norm = _kv_list_to_map(doc.get("code_value_model_norm_kv_ss"))
+from typing import Any, Dict, List, Tuple, Set
 
-    all_codes = set(human_raw) | set(human_norm) | set(model_raw) | set(model_norm)
+def build_codes_view(doc: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
+    """
+    Builds the UI table for codes.
+
+    Reads from any of these fields if present (first match wins per category):
+      Human raw:
+        - code_value_human_kv_ss
+      Human normalized:
+        - code_value_human_norm_kv_ss
+      Model raw:
+        - code_value_model_kv_ss
+      Model normalized:
+        - code_value_model_norm_kv_ss
+
+    Also supports some common alternates if your schema differs:
+      - code_values_human_kv_ss
+      - code_values_human_norm_kv_ss
+      - code_values_model_kv_ss
+      - code_values_model_norm_kv_ss
+    """
+
+    def _first_present(*keys: str) -> Any:
+        for k in keys:
+            if k in doc and doc.get(k) is not None:
+                return doc.get(k)
+        return None
+
+    human_raw  = _kv_list_to_map(_first_present("code_value_human_kv_ss", "code_values_human_kv_ss"))
+    human_norm = _kv_list_to_map(_first_present("code_value_human_norm_kv_ss", "code_values_human_norm_kv_ss"))
+    model_raw  = _kv_list_to_map(_first_present("code_value_model_kv_ss", "code_values_model_kv_ss"))
+    model_norm = _kv_list_to_map(_first_present("code_value_model_norm_kv_ss", "code_values_model_norm_kv_ss"))
+
+    all_codes: Set[str] = set(human_raw) | set(human_norm) | set(model_raw) | set(model_norm)
 
     rows: List[Dict[str, Any]] = []
     disagree_count = 0
+
+    def _norm_set(values: List[str]) -> Set[str]:
+        # normalize for disagreement check (case/space insensitive)
+        return {str(v).strip().lower() for v in (values or []) if str(v).strip()}
 
     for code in sorted(all_codes):
         hr = human_raw.get(code, [])
@@ -921,8 +1393,9 @@ def build_codes_view(doc: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], Dict[st
         if disagree:
             disagree_count += 1
 
-        # "best" value display: prefer human norm, then human raw, then model norm, then model raw
+        # best value for display
         best = None
+        src = None
         if hn:
             best = hn[0]
             src = "human"
@@ -935,24 +1408,24 @@ def build_codes_view(doc: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], Dict[st
         elif mr:
             best = mr[0]
             src = "model"
-        else:
-            src = None
 
         if has_human and has_model:
-            src = "both" if src else "both"
+            src = "both"
 
-        rows.append({
-            "code": code,
-            "has_human": has_human,
-            "has_model": has_model,
-            "human_raw": hr,
-            "human_norm": hn,
-            "model_raw": mr,
-            "model_norm": mn,
-            "best": best,
-            "source": src,
-            "disagree": disagree,
-        })
+        rows.append(
+            {
+                "code": code,
+                "has_human": has_human,
+                "has_model": has_model,
+                "human_raw": hr,
+                "human_norm": hn,
+                "model_raw": mr,
+                "model_norm": mn,
+                "best": best,
+                "source": src,
+                "disagree": disagree,
+            }
+        )
 
     stats = {
         "total": len(all_codes),
@@ -961,7 +1434,7 @@ def build_codes_view(doc: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], Dict[st
         "human_only": sum(1 for r in rows if r["has_human"] and not r["has_model"]),
         "model_only": sum(1 for r in rows if r["has_model"] and not r["has_human"]),
         "both": sum(1 for r in rows if r["has_human"] and r["has_model"]),
-        "disagree": disagree_count,  # ✅ your template uses this
+        "disagree": disagree_count,
     }
     return rows, stats
 

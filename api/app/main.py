@@ -744,15 +744,87 @@ def solr_add_docs(
         raise HTTPException(status_code=500, detail=f"Solr add failed: {r.status_code} {r.text[:800]}")
 
 
+# def solr_atomic_update(core: str, atomic_docs: List[dict], commit_within_ms: int = 5000) -> None:
+#     r = requests.post(
+#         f"{solr_core_url(core)}/update",
+#         params={"commitWithin": str(int(commit_within_ms))},
+#         json=atomic_docs,
+#         timeout=120,
+#     )
+#     if r.status_code >= 300:
+#         raise HTTPException(status_code=500, detail=f"Solr atomic update failed: {r.status_code} {r.text[:800]}")
+
 def solr_atomic_update(core: str, atomic_docs: List[dict], commit_within_ms: int = 5000) -> None:
-    r = requests.post(
-        f"{solr_core_url(core)}/update",
-        params={"commitWithin": str(int(commit_within_ms))},
-        json=atomic_docs,
-        timeout=120,
-    )
-    if r.status_code >= 300:
-        raise HTTPException(status_code=500, detail=f"Solr atomic update failed: {r.status_code} {r.text[:800]}")
+    """
+    Atomic update to Solr.
+
+    Improvements:
+    - Validates payload shape (helps catch silent "nothing updated" bugs).
+    - Adds explicit Content-Type header (some proxies/solr configs are picky).
+    - Logs a small debug summary (counts + first/last doc ids) to diagnose issues.
+    - Surfaces Solr error bodies cleanly.
+
+    IMPORTANT:
+    - Assumes Solr uniqueKey is `document_id_s` (your code uses that everywhere).
+    """
+    if not atomic_docs:
+        return
+
+    # Validate payload: every doc must include the unique key
+    missing_ids: list[int] = []
+    doc_ids: list[str] = []
+    for i, d in enumerate(atomic_docs):
+        if not isinstance(d, dict):
+            missing_ids.append(i)
+            continue
+        did = d.get("document_id_s")
+        if not did or not str(did).strip():
+            missing_ids.append(i)
+        else:
+            doc_ids.append(str(did))
+
+    if missing_ids:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Solr atomic update payload invalid: missing/invalid document_id_s at indexes {missing_ids[:50]}",
+        )
+
+    # Small debug helps massively when updates "succeed" but you see no changes
+    try:
+        logger.debug(
+            "Solr atomic update",
+            extra={
+                "core": core,
+                "count": len(atomic_docs),
+                "commitWithin": int(commit_within_ms),
+                "first_doc_id": doc_ids[0] if doc_ids else None,
+                "last_doc_id": doc_ids[-1] if doc_ids else None,
+            },
+        )
+    except Exception:
+        pass
+
+    url = f"{solr_core_url(core)}/update"
+    try:
+        r = requests.post(
+            url,
+            params={"commitWithin": str(int(commit_within_ms))},
+            json=atomic_docs,
+            headers={"Content-Type": "application/json"},
+            timeout=120,
+        )
+        if r.status_code >= 300:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Solr atomic update failed: {r.status_code} {r.text[:2000]}",
+            )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Solr atomic update error: {type(e).__name__}: {str(e)}",
+        ) from e
 
 
 def solr_update_codes_only(core: str, doc_codes: Dict[str, Dict[str, set[str]]]) -> int:
@@ -814,8 +886,36 @@ def solr_set_project_membership(core: str, doc_to_projects: dict[str, set[str]])
     return updated
 
 
+# def solr_select(core: str, params: dict) -> dict:
+#     """
+#     SOLR_BASE_URL may be:
+#       - http://solr:8983/solr        (common in docker)
+#       - http://solr:8983            (less common)
+#     This function handles both safely.
+#     """
+#     _require_solr()
+#     base = SOLR_BASE_URL.rstrip("/")
+#
+#     # If base already ends with /solr, don't add another /solr
+#     if base.endswith("/solr"):
+#         url = f"{base}/{core}/select"
+#     else:
+#         url = f"{base}/solr/{core}/select"
+#
+#     r = requests.get(url, params=params, timeout=60)
+#     r.raise_for_status()
+#     return r.json()
+
 def solr_select(core: str, params: dict) -> dict:
     """
+    Robust Solr select wrapper.
+
+    Fixes / improvements:
+    - Ensures list-valued params (e.g., fq, facet.field) are encoded correctly by requests.
+      Requests *can* handle list values, but we normalize to a list-of-tuples to avoid edge cases.
+    - Adds basic debug logging (without dumping huge params) to diagnose "no results".
+    - Gracefully handles Solr errors with an informative exception payload.
+
     SOLR_BASE_URL may be:
       - http://solr:8983/solr        (common in docker)
       - http://solr:8983            (less common)
@@ -830,9 +930,72 @@ def solr_select(core: str, params: dict) -> dict:
     else:
         url = f"{base}/solr/{core}/select"
 
-    r = requests.get(url, params=params, timeout=60)
-    r.raise_for_status()
-    return r.json()
+    # --- normalize params so repeated keys are sent correctly ---
+    # requests supports dict with list values, but normalizing to tuples is safer
+    def _flatten_params(p: dict) -> list[tuple[str, str]]:
+        out: list[tuple[str, str]] = []
+        for k, v in (p or {}).items():
+            if v is None:
+                continue
+            if isinstance(v, (list, tuple)):
+                for item in v:
+                    if item is None:
+                        continue
+                    out.append((str(k), str(item)))
+            else:
+                out.append((str(k), str(v)))
+        return out
+
+    flat_params = _flatten_params(params)
+
+    # Small, helpful debug (won't spam logs with huge strings)
+    try:
+        logger.debug(
+            "Solr select",
+            extra={
+                "core": core,
+                "url": url,
+                "q": params.get("q"),
+                "rows": params.get("rows"),
+                "start": params.get("start"),
+                "fq_count": len(params.get("fq") or []) if isinstance(params.get("fq"), (list, tuple)) else (1 if params.get("fq") else 0),
+                "facet": params.get("facet"),
+            },
+        )
+    except Exception:
+        pass
+
+    try:
+        r = requests.get(url, params=flat_params, timeout=60)
+        r.raise_for_status()
+        return r.json()
+    except requests.HTTPError as e:
+        # Try to surface Solr error body (very useful when it 400s)
+        body = None
+        try:
+            body = r.text  # type: ignore[name-defined]
+        except Exception:
+            body = None
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "error": "Solr request failed",
+                "core": core,
+                "url": url,
+                "status": getattr(r, "status_code", None),  # type: ignore[name-defined]
+                "body": body[:2000] if isinstance(body, str) else body,
+            },
+        ) from e
+    except Exception as e:
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "error": "Solr request error",
+                "core": core,
+                "url": url,
+                "message": str(e),
+            },
+        ) from e
 
 
 
@@ -930,32 +1093,80 @@ def normalize_fq(fq: str) -> str:
     return fq
 
 
+# def normalize_fl(fl: Optional[Union[str, List[str]]]) -> Optional[str]:
+#     """
+#     Accepts:
+#       - fl="a,b,c"
+#       - fl=["a", "b", "c"]
+#       - fl=["a,b", "c"]
+#     Returns a comma-joined string.
+#     """
+#     if not fl:
+#         return None
+#
+#     parts: List[str] = []
+#
+#     if isinstance(fl, list):
+#         for item in fl:
+#             for p in str(item).split(","):
+#                 p = p.strip()
+#                 if p:
+#                     parts.append(p)
+#     else:
+#         for p in str(fl).split(","):
+#             p = p.strip()
+#             if p:
+#                 parts.append(p)
+#
+#     return ",".join(parts) if parts else None
+
+from typing import Any, List, Optional, Union
+
 def normalize_fl(fl: Optional[Union[str, List[str]]]) -> Optional[str]:
     """
-    Accepts:
+    Normalize Solr `fl` so callers can pass:
       - fl="a,b,c"
       - fl=["a", "b", "c"]
       - fl=["a,b", "c"]
-    Returns a comma-joined string.
+
+    Returns:
+      - "a,b,c" with:
+          * whitespace trimmed
+          * empty items removed
+          * duplicates removed (preserves first-seen order)
     """
-    if not fl:
+    if fl is None:
         return None
 
     parts: List[str] = []
 
-    if isinstance(fl, list):
-        for item in fl:
-            for p in str(item).split(","):
-                p = p.strip()
-                if p:
-                    parts.append(p)
-    else:
-        for p in str(fl).split(","):
+    def _add_piece(piece: Any) -> None:
+        if piece is None:
+            return
+        s = str(piece).strip()
+        if not s:
+            return
+        # allow "a,b,c" in one piece
+        for p in s.split(","):
             p = p.strip()
             if p:
                 parts.append(p)
 
-    return ",".join(parts) if parts else None
+    if isinstance(fl, list):
+        for item in fl:
+            _add_piece(item)
+    else:
+        _add_piece(fl)
+
+    # de-dup while preserving order
+    seen = set()
+    out: List[str] = []
+    for p in parts:
+        if p not in seen:
+            seen.add(p)
+            out.append(p)
+
+    return ",".join(out) if out else None
 
 
 def solr_update_review_status(core: str, updates: list[dict]) -> int:
@@ -1010,6 +1221,91 @@ def solr_update_review_status(core: str, updates: list[dict]) -> int:
     return updated
 
 
+# def solr_update_topics_for_docs(
+#     core: str,
+#     doc_to_topics: Dict[str, List[Dict[str, Any]]],
+#     *,
+#     run_id: str,
+#     schema_version: Optional[str] = None,
+# ) -> int:
+#     """
+#     doc_to_topics: doc_id -> list of {topic_key, topic_label, score}
+#     Writes or clears:
+#       - topics_ss
+#       - topic_keys_ss
+#       - topic_kv_ss (e.g. T01=0.82)
+#       - has_topics_b
+#       - topic_run_id_s
+#       - schema_versions_ss (optional add)
+#     """
+#     if not doc_to_topics:
+#         return 0
+#
+#     atomic_docs: List[dict] = []
+#
+#     for doc_id, items in doc_to_topics.items():
+#
+#         # ----------------------------------------
+#         # CASE 1: NO ACTIVE TOPICS → CLEAR IN SOLR
+#         # ----------------------------------------
+#         if not items:
+#             atomic = {
+#                 "document_id_s": doc_id,
+#                 "has_topics_b": {"set": False},
+#                 # "topic_run_id_s": {"set": None},
+#                 "topic_run_id_s": {"set": str(run_id)},
+#                 "topics_ss": {"set": []},
+#                 "topic_keys_ss": {"set": []},
+#                 "topic_kv_ss": {"set": []},
+#             }
+#             atomic_docs.append(atomic)
+#             continue
+#
+#         # ----------------------------------------
+#         # CASE 2: ACTIVE TOPICS → NORMAL SET
+#         # ----------------------------------------
+#         labels: List[str] = []
+#         keys: List[str] = []
+#         kv: List[str] = []
+#
+#         for it in items:
+#             k = (it.get("topic_key") or "").strip()
+#             lab = (it.get("topic_label") or "").strip()
+#             sc = it.get("score")
+#
+#             if k:
+#                 keys.append(k)
+#             if lab:
+#                 labels.append(lab)
+#
+#             if k and sc is not None:
+#                 try:
+#                     kv.append(f"{k}={float(sc):.4f}")
+#                 except Exception:
+#                     kv.append(f"{k}={sc}")
+#
+#         atomic = {
+#             "document_id_s": doc_id,
+#             "has_topics_b": {"set": True},
+#             "topic_run_id_s": {"set": str(run_id)},
+#             "topics_ss": {"set": sorted(set(labels))},
+#             "topic_keys_ss": {"set": sorted(set(keys))},
+#             "topic_kv_ss": {"set": sorted(set(kv))},
+#         }
+#
+#         if schema_version:
+#             atomic["schema_versions_ss"] = {"add": schema_version}
+#
+#         atomic_docs.append(atomic)
+#
+#     updated = 0
+#     for batch in chunked(atomic_docs, 500):
+#         solr_atomic_update(core, batch, commit_within_ms=5000)
+#         updated += len(batch)
+#
+#     return updated
+#
+
 def solr_update_topics_for_docs(
     core: str,
     doc_to_topics: Dict[str, List[Dict[str, Any]]],
@@ -1019,73 +1315,97 @@ def solr_update_topics_for_docs(
 ) -> int:
     """
     doc_to_topics: doc_id -> list of {topic_key, topic_label, score}
-    Writes or clears:
-      - topics_ss
-      - topic_keys_ss
-      - topic_kv_ss (e.g. T01=0.82)
+
+    Writes or clears (atomic update):
+      - topics_ss         (labels)
+      - topic_keys_ss     (keys)
+      - topic_kv_ss       (e.g. T01=0.8234)
       - has_topics_b
       - topic_run_id_s
       - schema_versions_ss (optional add)
+
+    IMPORTANT BEHAVIOR FIX:
+    - If items is empty for a doc, we clear topics_* AND set topic_run_id_s to run_id,
+      so UI and downstream processes can still see the run provenance.
+    - We normalize/clean inputs and dedupe while preserving stable sort.
+    - We avoid accidental None/"" entries and we enforce string types.
     """
     if not doc_to_topics:
         return 0
 
+    if not run_id or not str(run_id).strip():
+        raise ValueError("run_id is required for solr_update_topics_for_docs")
+
+    run_id_s = str(run_id).strip()
     atomic_docs: List[dict] = []
 
     for doc_id, items in doc_to_topics.items():
+        doc_id_s = (doc_id or "").strip()
+        if not doc_id_s:
+            # skip invalid doc_id keys rather than writing broken docs
+            continue
 
         # ----------------------------------------
         # CASE 1: NO ACTIVE TOPICS → CLEAR IN SOLR
         # ----------------------------------------
         if not items:
-            atomic = {
-                "document_id_s": doc_id,
+            atomic: dict = {
+                "document_id_s": doc_id_s,
                 "has_topics_b": {"set": False},
-                # "topic_run_id_s": {"set": None},
-                "topic_run_id_s": {"set": str(run_id)},
+                "topic_run_id_s": {"set": run_id_s},
                 "topics_ss": {"set": []},
                 "topic_keys_ss": {"set": []},
                 "topic_kv_ss": {"set": []},
             }
+            if schema_version:
+                atomic["schema_versions_ss"] = {"add": str(schema_version)}
             atomic_docs.append(atomic)
             continue
 
         # ----------------------------------------
         # CASE 2: ACTIVE TOPICS → NORMAL SET
         # ----------------------------------------
-        labels: List[str] = []
-        keys: List[str] = []
-        kv: List[str] = []
+        labels_set: set[str] = set()
+        keys_set: set[str] = set()
+        kv_set: set[str] = set()
 
-        for it in items:
+        for it in items or []:
+            if not isinstance(it, dict):
+                continue
+
             k = (it.get("topic_key") or "").strip()
             lab = (it.get("topic_label") or "").strip()
             sc = it.get("score")
 
-            if k:
-                keys.append(k)
             if lab:
-                labels.append(lab)
+                labels_set.add(lab)
+            if k:
+                keys_set.add(k)
 
             if k and sc is not None:
+                # produce stable token key=value
                 try:
-                    kv.append(f"{k}={float(sc):.4f}")
+                    kv_set.add(f"{k}={float(sc):.4f}")
                 except Exception:
-                    kv.append(f"{k}={sc}")
+                    kv_set.add(f"{k}={str(sc)}")
 
-        atomic = {
-            "document_id_s": doc_id,
-            "has_topics_b": {"set": True},
-            "topic_run_id_s": {"set": str(run_id)},
-            "topics_ss": {"set": sorted(set(labels))},
-            "topic_keys_ss": {"set": sorted(set(keys))},
-            "topic_kv_ss": {"set": sorted(set(kv))},
+        labels = sorted(labels_set)
+        keys = sorted(keys_set)
+        kv = sorted(kv_set)
+
+        atomic2: dict = {
+            "document_id_s": doc_id_s,
+            "has_topics_b": {"set": True if (labels or keys or kv) else False},
+            "topic_run_id_s": {"set": run_id_s},
+            "topics_ss": {"set": labels},
+            "topic_keys_ss": {"set": keys},
+            "topic_kv_ss": {"set": kv},
         }
 
         if schema_version:
-            atomic["schema_versions_ss"] = {"add": schema_version}
+            atomic2["schema_versions_ss"] = {"add": str(schema_version)}
 
-        atomic_docs.append(atomic)
+        atomic_docs.append(atomic2)
 
     updated = 0
     for batch in chunked(atomic_docs, 500):
@@ -2763,6 +3083,137 @@ def list_project_documents(project_id: UUID, limit: int = 50, offset: int = 0):
 # SEARCH and SAMOKE
 #################################################################
 
+# @app.get("/search")
+# def search(
+#     q: str = "*:*",
+#     core: str = "hitl_test",
+#     rows: int = 20,
+#     start: int = 0,
+#     fq: Optional[List[str]] = Query(None),
+#     project_id: Optional[str] = None,
+#     include_hypothesis_links: bool = False,
+#     group_id: Optional[str] = None,
+# ):
+#     """
+#     Solr-backed search endpoint.
+#     fq is passed through but normalized so values containing ':' are safe
+#     (e.g. review_status_by_project_ss:<project_id>:done).
+#     """
+#
+#     params: Dict[str, Any] = {
+#         "q": q,
+#         "rows": rows,
+#         "start": start,
+#         "wt": "json",
+#         "fl": ",".join(
+#             [
+#                 "document_id_s",
+#                 "canonical_url_s",
+#                 "title_txt",
+#                 "excerpt_txt",
+#                 "published_dt",
+#                 "doc_type_s",
+#                 "source_s",
+#                 "judges_ss",
+#                 "has_human_b",
+#                 "has_any_span_b",
+#                 "codes_v1_ss",
+#                 "codes_ext_ss",
+#                 "codes_all_ss",
+#                 "project_ids_ss",
+#                 "topics_ss",
+#                 "topic_keys_ss",
+#                 "topic_kv_ss",
+#                 "topic_run_id_s",
+#                 "has_topics_b"
+#             ]
+#         ),
+#         "facet": "true",
+#         "facet.mincount": 1,
+#         "facet.limit": 50,
+#         "facet.field": [
+#             "doc_type_s",
+#             "source_s",
+#             "judges_ss",
+#             "has_human_b",
+#             "codes_all_ss",
+#             "appeal_outcome_s",
+#             "topics_ss"
+#         ],
+#     }
+#
+#     # -----------------------------
+#     # Filters (fq + project scope)
+#     # -----------------------------
+#     fq_list: List[str] = []
+#     has_review_filter = False
+#
+#
+#     if fq:
+#         for x in fq:
+#             if not x:
+#                 continue
+#             if x.startswith("review_status_by_project_ss:"):
+#                 has_review_filter = True
+#             fq_list.append(normalize_fq(x))
+#
+#     # 🔍 DEBUG GUARDRAIL
+#     if project_id and has_review_filter:
+#         logger.debug(
+#             "Project filter skipped: review_status_by_project_ss already scopes project",
+#             extra={"project_id": project_id, "fq": fq_list},
+#         )
+#
+#     # Only add project filter if NOT already implied by review_status
+#     if project_id and not has_review_filter:
+#         fq_list.append(normalize_fq(f"project_ids_ss:{project_id}"))
+#
+#     if fq_list:
+#         params["fq"] = fq_list
+#
+#     # -----------------------------
+#     # Query Solr
+#     # -----------------------------
+#     data = solr_select(core, params)
+#
+#     resp = data.get("response", {}) or {}
+#     docs = resp.get("docs", []) or []
+#     facets = (data.get("facet_counts", {}) or {}).get("facet_fields", {}) or {}
+#
+#     # -----------------------------
+#     # Normalize docs + add links
+#     # -----------------------------
+#     out_docs = []
+#     for d in docs:
+#         doc = dict(d)
+#
+#         cu = doc.get("canonical_url_s")
+#         if isinstance(cu, list):
+#             cu = cu[0] if cu else None
+#         doc["canonical_url_s"] = cu
+#
+#         if include_hypothesis_links and cu:
+#             gid = group_id or "__world__"
+#             doc["hypothesis_incontext"] = build_hypothesis_incontext(cu, gid)
+#
+#         out_docs.append(doc)
+#
+#     return {
+#         "ok": True,
+#         "core": core,
+#         "q": q,
+#         "fq": fq_list,
+#         "numFound": resp.get("numFound", 0),
+#         "start": start,
+#         "rows": rows,
+#         "docs": out_docs,
+#         "facets": facets,
+#     }
+
+
+from typing import Any, Dict, List, Optional, Union
+from fastapi import Query
+
 @app.get("/search")
 def search(
     q: str = "*:*",
@@ -2773,41 +3224,80 @@ def search(
     project_id: Optional[str] = None,
     include_hypothesis_links: bool = False,
     group_id: Optional[str] = None,
+    # ✅ CRITICAL: accept fl either as "a,b,c" OR as repeated fl=a&fl=b
+    fl: Optional[Union[str, List[str]]] = Query(None),
 ):
     """
     Solr-backed search endpoint.
-    fq is passed through but normalized so values containing ':' are safe
-    (e.g. review_status_by_project_ss:<project_id>:done).
+
+    Critical fix:
+    - Honors caller-provided `fl` (after normalize_fl), so doc_detail can request
+      code_value_* fields for the Codes table.
     """
 
+    # -----------------------------
+    # Hygiene
+    # -----------------------------
+    q_clean = (q or "").strip() or "*:*"
+
+    try:
+        rows_i = int(rows)
+    except Exception:
+        rows_i = 20
+    try:
+        start_i = int(start)
+    except Exception:
+        start_i = 0
+
+    rows_i = max(1, min(rows_i, 200))
+    start_i = max(0, start_i)
+
+    # -----------------------------
+    # Fields list (default + override)
+    # -----------------------------
+    default_fl_list = [
+        "document_id_s",
+        "canonical_url_s",
+        "title_txt",
+        "excerpt_txt",
+        "published_dt",
+        "doc_type_s",
+        "source_s",
+        "judges_ss",
+        "has_human_b",
+        "has_any_span_b",
+        "has_model_b",
+        "codes_present_human_ss",
+        "codes_present_model_ss",
+        "codes_v1_ss",
+        "codes_ext_ss",
+        "codes_all_ss",
+        "project_ids_ss",
+        "topics_ss",
+        "topic_keys_ss",
+        "topic_kv_ss",
+        "topic_run_id_s",
+        "has_topics_b",
+        # NOTE: not always needed in search list view, but safe if stored:
+        "code_value_human_kv_ss",
+        "code_value_human_norm_kv_ss",
+        "code_value_model_kv_ss",
+        "code_value_model_norm_kv_ss",
+        "values_human_txt",
+        "values_human_norm_txt",
+        "values_model_txt",
+        "values_model_norm_txt",
+    ]
+
+    fl_norm = normalize_fl(fl)
+    fl_out = fl_norm if fl_norm else ",".join(default_fl_list)
+
     params: Dict[str, Any] = {
-        "q": q,
-        "rows": rows,
-        "start": start,
+        "q": q_clean,
+        "rows": rows_i,
+        "start": start_i,
         "wt": "json",
-        "fl": ",".join(
-            [
-                "document_id_s",
-                "canonical_url_s",
-                "title_txt",
-                "excerpt_txt",
-                "published_dt",
-                "doc_type_s",
-                "source_s",
-                "judges_ss",
-                "has_human_b",
-                "has_any_span_b",
-                "codes_v1_ss",
-                "codes_ext_ss",
-                "codes_all_ss",
-                "project_ids_ss",
-                "topics_ss",
-                "topic_keys_ss",
-                "topic_kv_ss",
-                "topic_run_id_s",
-                "has_topics_b"
-            ]
-        ),
+        "fl": fl_out,  # ✅ this is the critical part
         "facet": "true",
         "facet.mincount": 1,
         "facet.limit": 50,
@@ -2818,7 +3308,7 @@ def search(
             "has_human_b",
             "codes_all_ss",
             "appeal_outcome_s",
-            "topics_ss"
+            "topics_ss",
         ],
     }
 
@@ -2828,7 +3318,6 @@ def search(
     fq_list: List[str] = []
     has_review_filter = False
 
-
     if fq:
         for x in fq:
             if not x:
@@ -2837,16 +3326,8 @@ def search(
                 has_review_filter = True
             fq_list.append(normalize_fq(x))
 
-    # 🔍 DEBUG GUARDRAIL
-    if project_id and has_review_filter:
-        logger.debug(
-            "Project filter skipped: review_status_by_project_ss already scopes project",
-            extra={"project_id": project_id, "fq": fq_list},
-        )
-
-    # Only add project filter if NOT already implied by review_status
     if project_id and not has_review_filter:
-        fq_list.append(normalize_fq(f"project_ids_ss:{project_id}"))
+        fq_list.append(normalize_fq(f'project_ids_ss:"{project_id}"'))
 
     if fq_list:
         params["fq"] = fq_list
@@ -2881,15 +3362,16 @@ def search(
     return {
         "ok": True,
         "core": core,
-        "q": q,
+        "q": q_clean,
         "fq": fq_list,
         "numFound": resp.get("numFound", 0),
-        "start": start,
-        "rows": rows,
+        "start": start_i,
+        "rows": rows_i,
         "docs": out_docs,
         "facets": facets,
+        # helpful for debugging:
+        "fl": fl_out,
     }
-
 
 
 

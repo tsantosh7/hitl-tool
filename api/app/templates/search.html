@@ -3,6 +3,9 @@
 <h1>Search Documents</h1>
 
 <form method="get" class="card">
+  <!-- preserve core across searches -->
+  <input type="hidden" name="core" value="{{ core or '' }}">
+
   <div class="row">
     <div class="grow">
       <label class="muted">Keyword</label>
@@ -125,9 +128,8 @@
 <table class="table">
   <thead>
     <tr>
-      <th>ID</th>
       <th>Title</th>
-<!--      <th>Source</th>-->
+      <th>Source</th>
       <th>Published</th>
       <th></th>
       <th></th>
@@ -138,7 +140,7 @@
     {% set docs = (result.get("docs") or []) %}
     {% if docs|length == 0 %}
       <tr>
-        <td colspan="6" class="muted">No results.</td>
+        <td colspan="5" class="muted">No results.</td>
       </tr>
     {% endif %}
 
@@ -146,7 +148,7 @@
       {% set doc_id = d.get("document_id_s","") %}
       {% set title = (d.get("title_txt") or [""])[0] %}
 
-<!--      {% set _source = d.get("source_s") %}-->
+      {% set _source = d.get("source_s") %}
       {% if _source is iterable and _source is not string %}
         {% set source = (_source[0] if _source|length > 0 else "") %}
       {% else %}
@@ -161,8 +163,6 @@
       {% endif %}
 
       <tr>
-        <td><span class="mono">{{ doc_id[:8] }}</span></td>
-
         <td>
           {% if title %}
             {{ title }}
@@ -175,7 +175,10 @@
         <td class="mono">{{ published if published else "—" }}</td>
 
         <td>
-          <a class="btnlink" href="/ui/docs/{{ doc_id }}">Open</a>
+          <a class="btnlink"
+             href="/ui/docs/{{ doc_id }}?core={{ core|urlencode }}&back_url={{ request.url|urlencode }}">
+            Open
+          </a>
         </td>
 
         <td>
@@ -190,9 +193,10 @@
 </table>
 
 <div class="row">
+  {% set core_q = core or '' %}
   {% if start|int > 0 %}
     <a class="btnlink"
-       href="/ui/search?kw={{ kw or '' }}&kw_field={{ kw_field or 'all' }}&include_codes_topics={{ include_codes_topics or '1' }}&q={{ q or '' }}&scope={{ scope }}&code={{ code or '' }}&topic={{ topic or '' }}&has_human={{ has_human or '' }}&has_any_span={{ has_any_span or '' }}&rows={{ rows }}&start={{ (start|int - rows|int) }}">
+       href="/ui/search?core={{ core_q|urlencode }}&kw={{ kw or '' }}&kw_field={{ kw_field or 'all' }}&include_codes_topics={{ include_codes_topics or '1' }}&q={{ q or '' }}&scope={{ scope }}&code={{ code or '' }}&topic={{ topic or '' }}&has_human={{ has_human or '' }}&has_any_span={{ has_any_span or '' }}&rows={{ rows }}&start={{ (start|int - rows|int) }}">
       Prev
     </a>
   {% endif %}
@@ -201,7 +205,7 @@
   {% set total = result.get("numFound", 0) %}
   {% if next_start < (total|int) %}
     <a class="btnlink"
-       href="/ui/search?kw={{ kw or '' }}&kw_field={{ kw_field or 'all' }}&include_codes_topics={{ include_codes_topics or '1' }}&q={{ q or '' }}&scope={{ scope }}&code={{ code or '' }}&topic={{ topic or '' }}&has_human={{ has_human or '' }}&has_any_span={{ has_any_span or '' }}&rows={{ rows }}&start={{ next_start }}">
+       href="/ui/search?core={{ core_q|urlencode }}&kw={{ kw or '' }}&kw_field={{ kw_field or 'all' }}&include_codes_topics={{ include_codes_topics or '1' }}&q={{ q or '' }}&scope={{ scope }}&code={{ code or '' }}&topic={{ topic or '' }}&has_human={{ has_human or '' }}&has_any_span={{ has_any_span or '' }}&rows={{ rows }}&start={{ next_start }}">
       Next
     </a>
   {% else %}
