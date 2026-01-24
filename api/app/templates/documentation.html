@@ -1,0 +1,315 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Documentation</h1>
+
+<div class="card">
+  <h2>Overview</h2>
+  <p class="muted">
+    This system supports a Human-in-the-Loop (HITL) annotation workflow where a model generates candidate
+    annotations and reviewers validate, correct, or reject them using Hypothesis. The platform keeps a full
+    audit trail in the database while keeping Hypothesis clean and usable by showing the latest model run.
+  </p>
+
+  <div class="meta">
+    <span class="pill">Audience: Reviewers, Admins</span>
+    <span class="pill">Tools: Dashboard + Hypothesis Extension</span>
+    <span class="pill">Workflow: Project → Search → Open → Annotate → Sync</span>
+  </div>
+</div>
+
+<div class="card">
+  <h2>Quick Start (5 minutes)</h2>
+  <ol>
+    <li><b>Install Hypothesis</b>: Install the Hypothesis browser extension.</li>
+    <li><b>Join the Group</b>: In Hypothesis, join your team group (e.g., <span class="mono">BXp1QL5v</span>).</li>
+    <li><b>Select a Project</b>: Open <b>Workspace</b> and choose a project.</li>
+    <li><b>Search Documents</b>: Click <b>Search Documents</b> and open a case.</li>
+    <li><b>Switch to the Group</b>: In the Hypothesis sidebar, select your group (not “Public”).</li>
+    <li><b>Review Model Annotations</b>: Reply with accept/reject/corrections using standard tags.</li>
+  </ol>
+
+  <div class="alert">
+    <b>Important:</b> If you don’t see annotations, the most common reason is that Hypothesis is set to the
+    wrong group (e.g., “Public”). Switch to the correct group and refresh the page.
+  </div>
+</div>
+
+<div class="card">
+  <h2>Roles & Permissions</h2>
+  <table class="table">
+    <thead>
+      <tr>
+        <th>Role</th>
+        <th>What you can do</th>
+        <th>What you cannot do</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><b>Reviewer</b></td>
+        <td>
+          Review model annotations, reply with decisions, create new annotations, add tags, correct values.
+        </td>
+        <td>
+          Cannot edit/delete annotations created by others (including the model/bot).
+        </td>
+      </tr>
+      <tr>
+        <td><b>Admin</b></td>
+        <td>
+          Everything a reviewer can do + create projects, manage workflow, run sync/cleanup scripts.
+        </td>
+        <td>
+          Cannot directly change Hypothesis permissions outside group membership rules.
+        </td>
+      </tr>
+      <tr>
+        <td><b>Model/Bot</b></td>
+        <td>
+          Posts model predictions as annotations, removes its own outdated/rejected model annotations.
+        </td>
+        <td>
+          Cannot delete or edit human annotations (enforced by Hypothesis).
+        </td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="card">
+  <h2>How to Use the Workspace</h2>
+
+  <h3>1) Select a Project</h3>
+  <p class="muted">
+    Use <b>Select Project</b> to choose which project you are working on. The selected project is your active
+    workspace for searching, adding documents, and exporting coded data.
+  </p>
+
+  <h3>2) Search Documents</h3>
+  <p class="muted">
+    Click <b>Search Documents</b> to find documents in the corpus. Use filters such as keywords, topics, or codes
+    (depending on what your deployment exposes). Open a document to review it and annotate.
+  </p>
+
+  <h3>3) Add to Project</h3>
+  <p class="muted">
+    Click <b>Add to Project</b> to attach documents to the selected project for review and export workflows.
+  </p>
+
+  <h3>4) Extract Coded Data</h3>
+  <p class="muted">
+    Click <b>Extract Coded Data</b> to export the project’s extracted variables (codes) into a CSV file for Excel,
+    Word, or SPSS workflows.
+  </p>
+
+  <h3>5) Add Codes</h3>
+  <p class="muted">
+    Click <b>Add Codes</b> to add new codes to the schema without contaminating existing codes.
+  </p>
+</div>
+
+<div class="card">
+  <h2>How Model Annotations Work in Hypothesis</h2>
+
+  <h3>What you will see</h3>
+  <ul>
+    <li>
+      <b>Anchored highlights</b>: If the system can reliably find the predicted value in the document text,
+      it creates a highlight at the exact quote.
+    </li>
+    <li>
+      <b>Unanchored notes</b>: If reliable highlighting isn’t possible, the system posts a page note with a message:
+      <span class="mono">(Unable to auto-highlight; please review.)</span>
+    </li>
+  </ul>
+
+  <h3>How to identify model annotations</h3>
+  <p class="muted">
+    Model annotations are tagged and formatted so you can spot them:
+  </p>
+
+  <ul>
+    <li><b>Prefix</b>: <span class="mono">[MODEL]</span></li>
+    <li><b>Tags</b> (examples): <span class="mono">source:model</span>, <span class="mono">bot:hitl</span>,
+      <span class="mono">run:&lt;run_id&gt;</span>, <span class="mono">field:&lt;FieldName&gt;</span></li>
+  </ul>
+
+  <div class="alert">
+    <b>Note about colours:</b> Hypothesis does not support changing highlight colour per annotation via the API.
+    Highlights are styled by the extension/site theme. (You can still distinguish model outputs via text + tags.)
+  </div>
+</div>
+
+<div class="card">
+  <h2>Reviewing Model Annotations (Standard Procedure)</h2>
+
+  <h3>Step-by-step</h3>
+  <ol>
+    <li>Open the document from the dashboard.</li>
+    <li>Open Hypothesis sidebar and select the project group.</li>
+    <li>Click a model annotation to see its details.</li>
+    <li>Decide: Accept, Reject, or Correct.</li>
+    <li>Reply to the model annotation with the appropriate tags.</li>
+  </ol>
+
+  <h3>Standard review tags (recommended)</h3>
+  <table class="table">
+    <thead>
+      <tr>
+        <th>Action</th>
+        <th>What to do</th>
+        <th>Tag(s)</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><b>Accept</b></td>
+        <td>Reply “Correct” or brief confirmation</td>
+        <td><span class="mono">review:accept</span></td>
+      </tr>
+      <tr>
+        <td><b>Reject</b></td>
+        <td>Reply with the reason and/or corrected value</td>
+        <td><span class="mono">review:reject</span> (or <span class="mono">review:incorrect</span>)</td>
+      </tr>
+      <tr>
+        <td><b>Correct</b></td>
+        <td>Reply with the corrected value and optionally create a new annotation highlighting the correct text</td>
+        <td><span class="mono">review:corrected</span></td>
+      </tr>
+      <tr>
+        <td><b>Needs discussion</b></td>
+        <td>Reply with the question and tag for follow-up</td>
+        <td><span class="mono">review:discuss</span></td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="alert">
+    <b>Best practice:</b> Prefer replying to model annotations (threaded review), and only create a new annotation
+    when the model missed the evidence or you need to highlight the correct span.
+  </div>
+</div>
+
+<div class="card">
+  <h2>Keeping Hypothesis Clean (“Only Latest Run”)</h2>
+  <p class="muted">
+    To avoid clutter, the system can keep only the latest model run visible in Hypothesis while storing older runs
+    in the database for auditing.
+  </p>
+
+  <ul>
+    <li><b>Old model annotations</b> (older <span class="mono">run:...</span>) may be deleted by the bot</li>
+    <li><b>Safety rule:</b> bot deletes only its own annotations, and only if there are no human replies</li>
+    <li><b>Rejected annotations</b> can be automatically cleaned up after review</li>
+  </ul>
+</div>
+
+<div class="card">
+  <h2>Scripts (Admin / Ops)</h2>
+
+  <h3>Push model predictions to Hypothesis</h3>
+  <pre class="mono" style="white-space:pre-wrap">
+export HYPOTHESIS_API_TOKEN="YOUR_TOKEN"
+
+python scripts/push_predictions_to_hypothesis_latest.py \
+  --group "BXp1QL5v" \
+  --predictions training/runs/your_run/predictions.jsonl \
+  --normalised data/normalised_data.jsonl \
+  --sleep 0.15
+</pre>
+
+  <h3>Reject cleanup (delete rejected model annotations)</h3>
+  <pre class="mono" style="white-space:pre-wrap">
+python scripts/cleanup_rejected_model_annotations.py \
+  --group "BXp1QL5v" \
+  --sleep 0.15
+</pre>
+
+  <h3>Sync annotations back into the platform (DB + Solr flags)</h3>
+  <pre class="mono" style="white-space:pre-wrap">
+python scripts/sync_hypothesis.py --token "$HYPOTHESIS_API_TOKEN" --core hitl_test
+
+# OR streaming sync client against your API
+python scripts/sync_hypothesis_stream_client.py --api http://localhost:8000 --core hitl_test
+</pre>
+
+  <div class="alert">
+    <b>Operational tip:</b> Run sync on a schedule (e.g., nightly) to keep the dashboard and export outputs aligned
+    with the latest human reviews.
+  </div>
+</div>
+
+<div class="card">
+  <h2>FAQs</h2>
+
+  <h3>1) I opened the page but I can’t see any annotations.</h3>
+  <p class="muted">
+    Make sure you selected the correct group in the Hypothesis sidebar (not “Public”). Refresh the page after switching.
+  </p>
+
+  <h3>2) Can we change model highlight colour (e.g., pink)?</h3>
+  <p class="muted">
+    Not via Hypothesis API. Highlight colour is controlled by the extension’s styling/theme. Use tags and the
+    <span class="mono">[MODEL]</span> prefix to distinguish model outputs.
+  </p>
+
+  <h3>3) Who can see model annotations?</h3>
+  <p class="muted">
+    Anyone who is a member of the Hypothesis group where the model annotations were posted.
+  </p>
+
+  <h3>4) Can reviewers delete model annotations?</h3>
+  <p class="muted">
+    Typically no. The recommended workflow is: reviewers reply with decisions and the bot deletes its own rejected/outdated annotations.
+  </p>
+
+  <h3>5) What happens if two reviewers disagree?</h3>
+  <p class="muted">
+    Both can reply to the same model annotation. The thread provides a discussion and audit trail. Your backend can decide
+    final status based on tags and policy (e.g., admin review, majority, etc.).
+  </p>
+
+  <h3>6) Why are some model annotations not highlighted?</h3>
+  <p class="muted">
+    Highlighting is only created when the predicted value can be found reliably and uniquely in the document text.
+    If it is ambiguous or not present as a unique substring, the system posts a page note instead.
+  </p>
+
+  <h3>7) Will running the push script multiple times create duplicates?</h3>
+  <p class="muted">
+    No. The system uses stable <span class="mono">pred_id:...</span> tags and document/run tags to deduplicate.
+  </p>
+
+  <h3>8) Does deleting old model annotations lose audit history?</h3>
+  <p class="muted">
+    No. Older runs are stored in your database for auditing. Hypothesis is kept clean by showing only the latest run.
+  </p>
+
+  <h3>9) How do I mark an annotation as rejected?</h3>
+  <p class="muted">
+    Reply to the model annotation and add tag <span class="mono">review:reject</span> (or <span class="mono">review:incorrect</span>).
+    The bot cleanup script can remove rejected model annotations later.
+  </p>
+
+  <h3>10) Can the bot delete human annotations?</h3>
+  <p class="muted">
+    No. Hypothesis enforces ownership. The bot can only delete annotations created by the bot account.
+  </p>
+</div>
+
+<div class="card">
+  <h2>Suggested Menu Link</h2>
+  <p class="muted">
+    Recommended: add a top navigation link to <span class="mono">/ui/docs</span> labeled <b>Documentation</b> or <b>How to Use</b>.
+    Name the template file something like <span class="mono">docs.html</span> or <span class="mono">how_to_use.html</span>.
+  </p>
+
+  <div class="meta">
+    <span class="pill">Template: templates/docs.html</span>
+    <span class="pill">Route: /ui/docs</span>
+    <span class="pill">Nav label: Documentation</span>
+  </div>
+</div>
+
+{% endblock %}

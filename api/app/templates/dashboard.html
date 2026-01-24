@@ -13,7 +13,7 @@
         </option>
       {% endfor %}
     </select>
-    <button type="submit">Use Project</button>
+    <button type="submit" class="btnlink">Use Project</button>
   </form>
 
   {% if selected_project_name %}
@@ -29,7 +29,7 @@
   <form method="post" action="/ui/projects/create">
     <div class="row">
       <input class="grow" name="name" placeholder="Project name" required>
-      <button type="submit">Create</button>
+      <button type="submit" class="btnlink">Create</button>
     </div>
     <div class="row">
       <input class="grow" name="team_name" value="Default Team" placeholder="Team name (optional)">
@@ -44,7 +44,9 @@
   <a class="bigbtn" href="/ui/search">Search Documents</a>
   <a class="bigbtn" href="/ui/add_to_project">Add to Project</a>
   <a class="bigbtn" href="/ui/export">Extract Coded Data</a>
-  <a class="bigbtn" href="/ui/codes">Add Codes</a>
+  <a class="bigbtn" href="/ui/codes">Available Codes</a>
+    <a class="bigbtn" href="/ui/documentation">Documentation</a>
+
 </div>
 
 

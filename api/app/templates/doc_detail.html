@@ -72,6 +72,16 @@
     {% else %}
       <span class="muted">No canonical URL</span>
     {% endif %}
+    {% if not in_project %}
+  <form method="post" action="/ui/projects/add_one">
+  <input type="hidden" name="document_id" value="{{ doc_id }}">
+  <input type="hidden" name="next" value="{{ return_to }}">
+  <button type="submit" class="btnlink">Add to Project</button>
+</form>
+
+{% else %}
+  <span class="pill">In project</span>
+{% endif %}
 
     <a class="btnlink" href="{{ back_href }}">Back to Search</a>
   </div>
@@ -120,7 +130,7 @@
         </div>
 
         {# DO NOT send topic_key; backend will generate deterministically from label #}
-        <button type="submit">Add Topic</button>
+        <button type="submit" class="btnlink">Add Topic</button>
       </form>
     </div>
   {% endif %}
@@ -166,7 +176,7 @@
       <input type="hidden" name="document_id" value="{{ doc_id }}">
       <input type="hidden" name="run_id" value="{{ run_id or '' }}">
       <input type="hidden" name="topic_label" value="{{ lbl }}">
-      <button type="submit">Accept</button>
+       <button type="submit" class="btnlink">Accept</button>
     </form>
 
     {# Reject: hide the suggestion #}
@@ -174,7 +184,7 @@
       <input type="hidden" name="document_id" value="{{ doc_id }}">
       <input type="hidden" name="topic_key" value="{{ key }}">
       <input type="hidden" name="run_id" value="{{ run_id or '' }}">
-      <button class="danger" type="submit">Reject</button>
+      <button class="btnlink danger" type="submit" >Reject</button>
     </form>
   {% endif %}
 
@@ -184,7 +194,7 @@
       <input type="hidden" name="document_id" value="{{ doc_id }}">
       <input type="hidden" name="topic_key" value="{{ key }}">
       <input type="hidden" name="run_id" value="{{ run_id or '' }}">
-      <button class="warn" type="submit">Remove</button>
+      <button class="btnlink warn" type="submit">Remove</button>
     </form>
   {% endif %}
 

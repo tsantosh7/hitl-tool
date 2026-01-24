@@ -1,7 +1,7 @@
 <!doctype html>
 <html>
 <head>
-  <title>{{ title or "HITL" }}</title>
+  <title>{{ title or "JUDDGES" }}</title>
   <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
@@ -11,14 +11,15 @@
 
   <header class="topbar">
     <div class="brand">
-      <a href="/ui/dashboard" class="brandlink">HITL</a>
+      <a href="/ui/dashboard" class="brandlink">JUDDGES</a>
     </div>
 
     <nav class="nav">
       <a href="/ui/search" class="{% if _path.startswith('/ui/search') %}active{% endif %}">Search Documents</a>
       <a href="/ui/add_to_project" class="{% if _path.startswith('/ui/add_to_project') %}active{% endif %}">Add to Project</a>
       <a href="/ui/export" class="{% if _path.startswith('/ui/export') %}active{% endif %}">Extract Coded Data</a>
-      <a href="/ui/codes" class="{% if _path.startswith('/ui/codes') %}active{% endif %}">Add Codes</a>
+      <a href="/ui/codes" class="{% if _path.startswith('/ui/codes') %}active{% endif %}">Available Codes</a>
+         <a href="/ui/documentation" class="{% if _path.startswith('/ui/documentation') %}active{% endif %}">Documentation</a>
     </nav>
 
     <div class="right">
