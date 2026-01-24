@@ -210,84 +210,13 @@ def _solr_escape_query(s: str) -> str:
     return s
 
 
-# def build_user_friendly_q(kw: str | None, kw_field: str, include_codes_topics: bool) -> str:
-#     """
-#     User-friendly search:
-#       - title/excerpt/body full text
-#       - human/model extracted values (raw + normalized)
-#     Optional:
-#       - codes_all_ss, topics_ss, topic_keys_ss, topic_kv_ss
-#
-#     kw_field:
-#       all      -> broad search
-#       title    -> title only
-#       excerpt  -> excerpt only
-#       body     -> body only
-#       values   -> values_* only
-#       url      -> canonical_url_s exact
-#       id       -> document_id_s exact
-#     """
-#     kw = (kw or "").strip()
-#     if not kw:
-#         return "*:*"
-#
-#     if kw_field == "url":
-#         return f'canonical_url_s:"{_solr_escape_phrase(kw)}"'
-#     if kw_field == "id":
-#         return f'document_id_s:"{_solr_escape_phrase(kw)}"'
-#
-#     qtext = _solr_escape_query(kw)
-#
-#     # Text fields (edismax qf)
-#     qf_all = (
-#         "title_txt^4 "
-#         "excerpt_txt^2 "
-#         "body_txt "
-#         "values_human_txt "
-#         "values_model_txt "
-#         "values_human_norm_txt "
-#         "values_model_norm_txt"
-#     )
-#     qf_title = "title_txt^4"
-#     qf_excerpt = "excerpt_txt^2"
-#     qf_body = "body_txt"
-#     qf_values = "values_human_txt values_model_txt values_human_norm_txt values_model_norm_txt"
-#
-#     if kw_field == "title":
-#         qf = qf_title
-#     elif kw_field == "excerpt":
-#         qf = qf_excerpt
-#     elif kw_field == "body":
-#         qf = qf_body
-#     elif kw_field == "values":
-#         qf = qf_values
-#     else:
-#         qf = qf_all
-#
-#     base = f'{{!edismax qf="{qf}" pf="{qf_title}" mm=1}}{qtext}'
-#
-#     if include_codes_topics:
-#         p = _solr_escape_phrase(kw)
-#         extra = (
-#             f' OR codes_all_ss:"{p}"'
-#             f' OR topics_ss:"{p}"'
-#             f' OR topic_keys_ss:"{p}"'
-#             f' OR topic_kv_ss:"{p}"'
-#         )
-#         return f"({base}{extra})"
-#
-#     return base
-
 def build_user_friendly_q(kw: str | None, kw_field: str, include_codes_topics: bool) -> str:
     """
-    User-friendly Solr query builder.
-
-    Goals:
-    - Never return a malformed query (esp. for special chars).
-    - If kw is empty -> match all (*:*).
-    - Support exact match for url/id fields.
-    - Broad keyword search uses edismax over your indexed text fields.
-    - Optional: also match codes/topics fields (works for both Solr single/multi-valued strings).
+    User-friendly search:
+      - title/excerpt/body full text
+      - human/model extracted values (raw + normalized)
+    Optional:
+      - codes_all_ss, topics_ss, topic_keys_ss, topic_kv_ss
 
     kw_field:
       all      -> broad search
@@ -302,16 +231,14 @@ def build_user_friendly_q(kw: str | None, kw_field: str, include_codes_topics: b
     if not kw:
         return "*:*"
 
-    # Exact-match modes
     if kw_field == "url":
         return f'canonical_url_s:"{_solr_escape_phrase(kw)}"'
     if kw_field == "id":
         return f'document_id_s:"{_solr_escape_phrase(kw)}"'
 
-    # edismax keyword search
     qtext = _solr_escape_query(kw)
 
-    # NOTE: Keep qf fields aligned with what your /search endpoint returns & schema supports.
+    # Text fields (edismax qf)
     qf_all = (
         "title_txt^4 "
         "excerpt_txt^2 "
@@ -337,36 +264,19 @@ def build_user_friendly_q(kw: str | None, kw_field: str, include_codes_topics: b
     else:
         qf = qf_all
 
-    # pf kept tight (title boost)
     base = f'{{!edismax qf="{qf}" pf="{qf_title}" mm=1}}{qtext}'
 
-    if not include_codes_topics:
-        return base
+    if include_codes_topics:
+        p = _solr_escape_phrase(kw)
+        extra = (
+            f' OR codes_all_ss:"{p}"'
+            f' OR topics_ss:"{p}"'
+            f' OR topic_keys_ss:"{p}"'
+            f' OR topic_kv_ss:"{p}"'
+        )
+        return f"({base}{extra})"
 
-    # Also match common code/topic representations.
-    # IMPORTANT: use quoted phrase matching for exact tokens like "T01" or "offence_single".
-    p = _solr_escape_phrase(kw)
-
-    # Some installations store topics in multiple fields; we try the common ones.
-    # If a field doesn't exist in schema, Solr typically ignores it *only if* you don't
-    # have "fail-on-undefined-field" behavior. If your Solr is strict, we can reduce this list.
-    extra_terms = [
-        f'codes_all_ss:"{p}"',
-        f'codes_present_human_ss:"{p}"',
-        f'codes_present_model_ss:"{p}"',
-
-        f'topics_ss:"{p}"',
-        f'topic_keys_ss:"{p}"',
-        f'topic_kv_ss:"{p}"',
-
-        # Sometimes people search by "T01=0.82" tokens
-        f'topic_kv_ss:"{p}"',
-    ]
-
-    extra = " OR ".join(extra_terms)
-
-    # Wrap to ensure correct precedence.
-    return f"({base} OR {extra})"
+    return base
 
 
 # -------------------------

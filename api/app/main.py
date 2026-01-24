@@ -888,6 +888,14 @@ def solr_set_project_membership(core: str, doc_to_projects: dict[str, set[str]])
 
 # def solr_select(core: str, params: dict) -> dict:
 #     """
+#     Robust Solr select wrapper.
+#
+#     Fixes / improvements:
+#     - Ensures list-valued params (e.g., fq, facet.field) are encoded correctly by requests.
+#       Requests *can* handle list values, but we normalize to a list-of-tuples to avoid edge cases.
+#     - Adds basic debug logging (without dumping huge params) to diagnose "no results".
+#     - Gracefully handles Solr errors with an informative exception payload.
+#
 #     SOLR_BASE_URL may be:
 #       - http://solr:8983/solr        (common in docker)
 #       - http://solr:8983            (less common)
@@ -902,36 +910,116 @@ def solr_set_project_membership(core: str, doc_to_projects: dict[str, set[str]])
 #     else:
 #         url = f"{base}/solr/{core}/select"
 #
-#     r = requests.get(url, params=params, timeout=60)
-#     r.raise_for_status()
-#     return r.json()
+#     # --- normalize params so repeated keys are sent correctly ---
+#     # requests supports dict with list values, but normalizing to tuples is safer
+#     def _flatten_params(p: dict) -> list[tuple[str, str]]:
+#         out: list[tuple[str, str]] = []
+#         for k, v in (p or {}).items():
+#             if v is None:
+#                 continue
+#             if isinstance(v, (list, tuple)):
+#                 for item in v:
+#                     if item is None:
+#                         continue
+#                     out.append((str(k), str(item)))
+#             else:
+#                 out.append((str(k), str(v)))
+#         return out
+#
+#     flat_params = _flatten_params(params)
+#
+#     # Small, helpful debug (won't spam logs with huge strings)
+#     try:
+#         logger.debug(
+#             "Solr select",
+#             extra={
+#                 "core": core,
+#                 "url": url,
+#                 "q": params.get("q"),
+#                 "rows": params.get("rows"),
+#                 "start": params.get("start"),
+#                 "fq_count": len(params.get("fq") or []) if isinstance(params.get("fq"), (list, tuple)) else (1 if params.get("fq") else 0),
+#                 "facet": params.get("facet"),
+#             },
+#         )
+#     except Exception:
+#         pass
+#
+#     try:
+#         r = requests.get(url, params=flat_params, timeout=60)
+#         r.raise_for_status()
+#         return r.json()
+#     except requests.HTTPError as e:
+#         # Try to surface Solr error body (very useful when it 400s)
+#         body = None
+#         try:
+#             body = r.text  # type: ignore[name-defined]
+#         except Exception:
+#             body = None
+#         raise HTTPException(
+#             status_code=502,
+#             detail={
+#                 "error": "Solr request failed",
+#                 "core": core,
+#                 "url": url,
+#                 "status": getattr(r, "status_code", None),  # type: ignore[name-defined]
+#                 "body": body[:2000] if isinstance(body, str) else body,
+#             },
+#         ) from e
+#     except Exception as e:
+#         raise HTTPException(
+#             status_code=502,
+#             detail={
+#                 "error": "Solr request error",
+#                 "core": core,
+#                 "url": url,
+#                 "message": str(e),
+#             },
+#         ) from e
+
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+_SOLR_SESSION: requests.Session | None = None
+
+def _get_solr_session() -> requests.Session:
+    global _SOLR_SESSION
+    if _SOLR_SESSION is not None:
+        return _SOLR_SESSION
+
+    s = requests.Session()
+
+    # Keep retries conservative (Solr should be stable)
+    retries = Retry(
+        total=2,
+        backoff_factor=0.1,
+        status_forcelist=(502, 503, 504),
+        allowed_methods=("GET",),
+        raise_on_status=False,
+    )
+
+    adapter = HTTPAdapter(
+        pool_connections=20,
+        pool_maxsize=50,
+        max_retries=retries,
+    )
+    s.mount("http://", adapter)
+    s.mount("https://", adapter)
+
+    _SOLR_SESSION = s
+    return s
+
 
 def solr_select(core: str, params: dict) -> dict:
-    """
-    Robust Solr select wrapper.
-
-    Fixes / improvements:
-    - Ensures list-valued params (e.g., fq, facet.field) are encoded correctly by requests.
-      Requests *can* handle list values, but we normalize to a list-of-tuples to avoid edge cases.
-    - Adds basic debug logging (without dumping huge params) to diagnose "no results".
-    - Gracefully handles Solr errors with an informative exception payload.
-
-    SOLR_BASE_URL may be:
-      - http://solr:8983/solr        (common in docker)
-      - http://solr:8983            (less common)
-    This function handles both safely.
-    """
     _require_solr()
     base = SOLR_BASE_URL.rstrip("/")
 
-    # If base already ends with /solr, don't add another /solr
     if base.endswith("/solr"):
         url = f"{base}/{core}/select"
     else:
         url = f"{base}/solr/{core}/select"
 
-    # --- normalize params so repeated keys are sent correctly ---
-    # requests supports dict with list values, but normalizing to tuples is safer
     def _flatten_params(p: dict) -> list[tuple[str, str]]:
         out: list[tuple[str, str]] = []
         for k, v in (p or {}).items():
@@ -948,32 +1036,18 @@ def solr_select(core: str, params: dict) -> dict:
 
     flat_params = _flatten_params(params)
 
-    # Small, helpful debug (won't spam logs with huge strings)
-    try:
-        logger.debug(
-            "Solr select",
-            extra={
-                "core": core,
-                "url": url,
-                "q": params.get("q"),
-                "rows": params.get("rows"),
-                "start": params.get("start"),
-                "fq_count": len(params.get("fq") or []) if isinstance(params.get("fq"), (list, tuple)) else (1 if params.get("fq") else 0),
-                "facet": params.get("facet"),
-            },
-        )
-    except Exception:
-        pass
+    # Much tighter timeout: (connect, read)
+    timeout = (3.0, 15.0)
 
+    sess = _get_solr_session()
     try:
-        r = requests.get(url, params=flat_params, timeout=60)
+        r = sess.get(url, params=flat_params, timeout=timeout)
         r.raise_for_status()
         return r.json()
     except requests.HTTPError as e:
-        # Try to surface Solr error body (very useful when it 400s)
         body = None
         try:
-            body = r.text  # type: ignore[name-defined]
+            body = r.text
         except Exception:
             body = None
         raise HTTPException(
@@ -982,7 +1056,7 @@ def solr_select(core: str, params: dict) -> dict:
                 "error": "Solr request failed",
                 "core": core,
                 "url": url,
-                "status": getattr(r, "status_code", None),  # type: ignore[name-defined]
+                "status": getattr(r, "status_code", None),
                 "body": body[:2000] if isinstance(body, str) else body,
             },
         ) from e
@@ -996,7 +1070,6 @@ def solr_select(core: str, params: dict) -> dict:
                 "message": str(e),
             },
         ) from e
-
 
 
 def solr_escape_term(s: str) -> str:
@@ -3083,106 +3156,111 @@ def list_project_documents(project_id: UUID, limit: int = 50, offset: int = 0):
 # SEARCH and SAMOKE
 #################################################################
 
+
+from typing import Any, Dict, List, Optional, Union
+from fastapi import Query
+
 # @app.get("/search")
 # def search(
-#     q: str = "*:*",
+#     # user friendly keyword (what humans type)
+#     kw: Optional[str] = None,
+#
+#     # where to search
+#     kw_field: str = "all",  # all | title | body | excerpt | values | url | id
+#
+#     # core + paging
 #     core: str = "hitl_test",
 #     rows: int = 20,
 #     start: int = 0,
+#
+#     # filters
 #     fq: Optional[List[str]] = Query(None),
+#
+#     # ✅ IMPORTANT: do NOT scope automatically unless you are 100% sure project_ids_ss is populated in Solr
 #     project_id: Optional[str] = None,
+#     scope_project: bool = False,  # default OFF to avoid "0 results"
+#
+#     # performance knobs
+#     facets: bool = False,         # default OFF (big win)
+#     include_codes_topics: bool = False,  # default OFF (you said you can drop these)
 #     include_hypothesis_links: bool = False,
 #     group_id: Optional[str] = None,
+#
+#     # allow callers to override fl (optional)
+#     fl: Optional[Union[str, List[str]]] = Query(None),
 # ):
-#     """
-#     Solr-backed search endpoint.
-#     fq is passed through but normalized so values containing ':' are safe
-#     (e.g. review_status_by_project_ss:<project_id>:done).
-#     """
+#     # -----------------------------
+#     # Hygiene
+#     # -----------------------------
+#     try:
+#         rows_i = max(1, min(int(rows), 200))
+#     except Exception:
+#         rows_i = 20
+#     try:
+#         start_i = max(0, int(start))
+#     except Exception:
+#         start_i = 0
+#
+#     # -----------------------------
+#     # Build Solr q using edismax (correct for title/body search)
+#     # -----------------------------
+#     q = build_user_friendly_q(kw, kw_field=kw_field, include_codes_topics=include_codes_topics)
+#
+#     # -----------------------------
+#     # Minimal fields for list view (FAST)
+#     # -----------------------------
+#     default_fl_list = [
+#         "document_id_s",
+#         "canonical_url_s",
+#         "title_txt",
+#         "published_dt",
+#         "source_s",
+#         "doc_type_s",
+#         "excerpt_txt",   # optional, remove if you want even faster
+#     ]
+#
+#     fl_norm = normalize_fl(fl)
+#     fl_out = fl_norm if fl_norm else ",".join(default_fl_list)
 #
 #     params: Dict[str, Any] = {
 #         "q": q,
-#         "rows": rows,
-#         "start": start,
+#         "rows": rows_i,
+#         "start": start_i,
 #         "wt": "json",
-#         "fl": ",".join(
-#             [
-#                 "document_id_s",
-#                 "canonical_url_s",
-#                 "title_txt",
-#                 "excerpt_txt",
-#                 "published_dt",
-#                 "doc_type_s",
-#                 "source_s",
-#                 "judges_ss",
-#                 "has_human_b",
-#                 "has_any_span_b",
-#                 "codes_v1_ss",
-#                 "codes_ext_ss",
-#                 "codes_all_ss",
-#                 "project_ids_ss",
-#                 "topics_ss",
-#                 "topic_keys_ss",
-#                 "topic_kv_ss",
-#                 "topic_run_id_s",
-#                 "has_topics_b"
-#             ]
-#         ),
-#         "facet": "true",
-#         "facet.mincount": 1,
-#         "facet.limit": 50,
-#         "facet.field": [
-#             "doc_type_s",
-#             "source_s",
-#             "judges_ss",
-#             "has_human_b",
-#             "codes_all_ss",
-#             "appeal_outcome_s",
-#             "topics_ss"
-#         ],
+#         "fl": fl_out,
 #     }
 #
 #     # -----------------------------
-#     # Filters (fq + project scope)
+#     # Filters
 #     # -----------------------------
 #     fq_list: List[str] = []
-#     has_review_filter = False
-#
-#
 #     if fq:
 #         for x in fq:
-#             if not x:
-#                 continue
-#             if x.startswith("review_status_by_project_ss:"):
-#                 has_review_filter = True
-#             fq_list.append(normalize_fq(x))
+#             if x:
+#                 fq_list.append(normalize_fq(x))
 #
-#     # 🔍 DEBUG GUARDRAIL
-#     if project_id and has_review_filter:
-#         logger.debug(
-#             "Project filter skipped: review_status_by_project_ss already scopes project",
-#             extra={"project_id": project_id, "fq": fq_list},
-#         )
-#
-#     # Only add project filter if NOT already implied by review_status
-#     if project_id and not has_review_filter:
-#         fq_list.append(normalize_fq(f"project_ids_ss:{project_id}"))
+#     # ✅ Only apply project scoping if explicitly requested
+#     if scope_project and project_id:
+#         fq_list.append(normalize_fq(f'project_ids_ss:"{project_id}"'))
 #
 #     if fq_list:
 #         params["fq"] = fq_list
 #
 #     # -----------------------------
-#     # Query Solr
+#     # Facets (OFF by default)
 #     # -----------------------------
-#     data = solr_select(core, params)
+#     if facets:
+#         params.update({
+#             "facet": "true",
+#             "facet.mincount": 1,
+#             "facet.limit": 50,
+#             "facet.field": ["doc_type_s", "source_s", "judges_ss"],
+#         })
 #
+#     data = solr_select(core, params)
 #     resp = data.get("response", {}) or {}
 #     docs = resp.get("docs", []) or []
-#     facets = (data.get("facet_counts", {}) or {}).get("facet_fields", {}) or {}
 #
-#     # -----------------------------
-#     # Normalize docs + add links
-#     # -----------------------------
 #     out_docs = []
 #     for d in docs:
 #         doc = dict(d)
@@ -3201,14 +3279,21 @@ def list_project_documents(project_id: UUID, limit: int = 50, offset: int = 0):
 #     return {
 #         "ok": True,
 #         "core": core,
+#         "kw": (kw or "").strip(),
+#         "kw_field": kw_field,
 #         "q": q,
 #         "fq": fq_list,
 #         "numFound": resp.get("numFound", 0),
-#         "start": start,
-#         "rows": rows,
+#         "start": start_i,
+#         "rows": rows_i,
 #         "docs": out_docs,
-#         "facets": facets,
+#         "facets": ((data.get("facet_counts", {}) or {}).get("facet_fields", {}) or {}) if facets else {},
+#         "fl": fl_out,
+#         "facets_enabled": facets,
+#         "scope_project": scope_project,
 #     }
+
+
 
 
 from typing import Any, Dict, List, Optional, Union
@@ -3261,32 +3346,32 @@ def search(
         "title_txt",
         "excerpt_txt",
         "published_dt",
-        "doc_type_s",
-        "source_s",
-        "judges_ss",
+        # "doc_type_s",
+        # "source_s",
+        # "judges_ss",
         "has_human_b",
         "has_any_span_b",
         "has_model_b",
-        "codes_present_human_ss",
-        "codes_present_model_ss",
+        # "codes_present_human_ss",
+        # "codes_present_model_ss",
         "codes_v1_ss",
         "codes_ext_ss",
         "codes_all_ss",
         "project_ids_ss",
         "topics_ss",
-        "topic_keys_ss",
+        # "topic_keys_ss",
         "topic_kv_ss",
-        "topic_run_id_s",
+        # "topic_run_id_s",
         "has_topics_b",
         # NOTE: not always needed in search list view, but safe if stored:
         "code_value_human_kv_ss",
-        "code_value_human_norm_kv_ss",
+        # "code_value_human_norm_kv_ss",
         "code_value_model_kv_ss",
-        "code_value_model_norm_kv_ss",
-        "values_human_txt",
-        "values_human_norm_txt",
-        "values_model_txt",
-        "values_model_norm_txt",
+        # "code_value_model_norm_kv_ss",
+        # "values_human_txt",
+        # "values_human_norm_txt",
+        # "values_model_txt",
+        # "values_model_norm_txt",
     ]
 
     fl_norm = normalize_fl(fl)
@@ -3304,10 +3389,10 @@ def search(
         "facet.field": [
             "doc_type_s",
             "source_s",
-            "judges_ss",
+            # "judges_ss",
             "has_human_b",
             "codes_all_ss",
-            "appeal_outcome_s",
+            # "appeal_outcome_s",
             "topics_ss",
         ],
     }

@@ -29,6 +29,9 @@ services:
       - solrdata:/var/solr
       - ./solr/configsets:/var/solr/data/configsets
     user: "0:0"
+    environment:
+      - SOLR_HEAP=4g
+      - SOLR_JAVA_MEM=-Xms4g -Xmx4g    
     command: >
       bash -lc "chown -R solr:solr /var/solr && su -s /bin/bash solr -c '/opt/solr/bin/solr -f'"
 
